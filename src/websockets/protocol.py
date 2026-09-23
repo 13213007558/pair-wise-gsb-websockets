@@ -4,6 +4,7 @@ import enum
 import logging
 import uuid
 from collections.abc import Generator
+from typing import Literal
 
 from .exceptions import (
     ConnectionClosed,
@@ -14,6 +15,7 @@ from .exceptions import (
     ProtocolError,
 )
 from .extensions import Extension
+from .extensions.permessage_deflate import PerMessageDeflate
 from .frames import (
     BINARY,
     CLOSE,
@@ -315,7 +317,13 @@ class Protocol:
         self.expect_continuation_frame = not fin
         self.send_frame(Frame(CONT, data, fin))
 
-    def send_text(self, data: BytesLike, fin: bool = True) -> None:
+    def send_text(
+        self,
+        data: BytesLike,
+        fin: bool = True,
+        *,
+        compress: bool | Literal["auto"] | None = None,
+    ) -> None:
         """
         Send a `Text frame`_.
 
@@ -326,6 +334,10 @@ class Protocol:
             data: payload containing text encoded with UTF-8.
             fin: FIN bit; set it to :obj:`False` if this is the first frame of
                 a fragmented message.
+            compress: compression policy for this message, if the
+                Per-Message Deflate extension is enabled; :obj:`None`
+                compresses the message, :obj:`False` sends it uncompressed,
+                and ``"auto"`` compresses it only if that makes it smaller.
 
         Raises:
             ProtocolError: If a fragmented message is in progress.
@@ -335,10 +347,18 @@ class Protocol:
             raise ProtocolError("expected a continuation frame")
         if self._state is not OPEN:
             raise InvalidState(f"connection is {self.state.name.lower()}")
+        if compress is not None:
+            self.set_compression_policy(compress)
         self.expect_continuation_frame = not fin
         self.send_frame(Frame(TEXT, data, fin))
 
-    def send_binary(self, data: BytesLike, fin: bool = True) -> None:
+    def send_binary(
+        self,
+        data: BytesLike,
+        fin: bool = True,
+        *,
+        compress: bool | Literal["auto"] | None = None,
+    ) -> None:
         """
         Send a `Binary frame`_.
 
@@ -349,6 +369,10 @@ class Protocol:
             data: payload containing arbitrary binary data.
             fin: FIN bit; set it to :obj:`False` if this is the first frame of
                 a fragmented message.
+            compress: compression policy for this message, if the
+                Per-Message Deflate extension is enabled; :obj:`None`
+                compresses the message, :obj:`False` sends it uncompressed,
+                and ``"auto"`` compresses it only if that makes it smaller.
 
         Raises:
             ProtocolError: If a fragmented message is in progress.
@@ -358,8 +382,26 @@ class Protocol:
             raise ProtocolError("expected a continuation frame")
         if self._state is not OPEN:
             raise InvalidState(f"connection is {self.state.name.lower()}")
+        if compress is not None:
+            self.set_compression_policy(compress)
         self.expect_continuation_frame = not fin
         self.send_frame(Frame(BINARY, data, fin))
+
+    def set_compression_policy(self, compress: bool | Literal["auto"]) -> None:
+        """
+        Set the compression policy for the next message.
+
+        Parameters:
+            compress: :obj:`True` compresses the message, :obj:`False`
+                sends it uncompressed, and ``"auto"`` compresses it only if
+                that makes it smaller.
+
+        """
+        if compress not in (True, False, "auto"):
+            raise ValueError(f"invalid compression policy: {compress!r}")
+        for extension in self.extensions:
+            if isinstance(extension, PerMessageDeflate):
+                extension.compress_policy = compress
 
     def send_close(self, code: CloseCode | int | None = None, reason: str = "") -> None:
         """

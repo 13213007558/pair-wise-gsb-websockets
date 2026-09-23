@@ -35,6 +35,11 @@ notice.
 New features
 ............
 
+* Added a ``compress`` argument to
+  :meth:`~asyncio.connection.Connection.send` and
+  :meth:`~sync.connection.Connection.send` to control compression on a
+  per-message basis when the Per-Message Deflate extension is enabled.
+
 * Added :meth:`~sync.connection.Connection.wait_closed` to the :mod:`threading`
   implementation.
 

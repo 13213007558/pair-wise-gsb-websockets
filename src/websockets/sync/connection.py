@@ -418,6 +418,7 @@ class Connection:
         message: DataLike | Iterable[DataLike],
         *,
         text: bool | None = None,
+        compress: bool | Literal["auto"] | None = None,
     ) -> None:
         """
         Send a message.
@@ -452,6 +453,23 @@ class Connection:
         (If you really want to send the keys of a dict-like object as fragments,
         call its :meth:`~dict.keys` method and pass the result to :meth:`send`.)
 
+        When the Per-Message Deflate extension is enabled, you may override
+        the compression policy for this message with the ``compress`` argument:
+
+        * Set ``compress=True`` to compress the message.
+        * Set ``compress=False`` to send the message uncompressed. This is
+          useful for small messages that don't benefit from compression.
+        * Set ``compress="auto"`` to compress the message only if that makes
+          it smaller. This requires the complete message, so it applies only
+          to strings and bytes-like objects; with an iterable of fragments,
+          it falls back to the default behavior.
+        * The default, ``compress=None``, preserves the default behavior:
+          messages are compressed.
+
+        Compressed and uncompressed messages can be mixed on the same
+        connection. For a fragmented message, the policy is chosen when
+        sending the first fragment and applies to all continuations.
+
         When the connection is closed, :meth:`send` raises
         :exc:`~websockets.exceptions.ConnectionClosed`. Specifically, it
         raises :exc:`~websockets.exceptions.ConnectionClosedOK` after a normal
@@ -462,14 +480,19 @@ class Connection:
         Args:
             message: Message to send.
             text: Force sending in a Text_ or Binary_ frame.
+            compress: Compression policy for this message.
 
         Raises:
             ConnectionClosed: When the connection is closed.
             ConcurrencyError: If the connection is sending a fragmented message.
             TypeError: If ``message`` doesn't have a supported type.
+            ValueError: If ``compress`` isn't a supported policy.
 
         """
         self.maybe_raise_legacy_warning()
+        if compress not in (None, True, False, "auto"):
+            raise ValueError(f"invalid compression policy: {compress!r}")
+
         # Unfragmented message — this case must be handled first because
         # strings and bytes-like objects are iterable.
 
@@ -480,9 +503,9 @@ class Connection:
                         "cannot call send while another thread is already running send"
                     )
                 if text is False:
-                    self.protocol.send_binary(message.encode())
+                    self.protocol.send_binary(message.encode(), compress=compress)
                 else:
-                    self.protocol.send_text(message.encode())
+                    self.protocol.send_text(message.encode(), compress=compress)
 
         elif isinstance(message, BytesLike):
             with self.send_context():
@@ -491,9 +514,9 @@ class Connection:
                         "cannot call send while another thread is already running send"
                     )
                 if text is True:
-                    self.protocol.send_text(message)
+                    self.protocol.send_text(message, compress=compress)
                 else:
-                    self.protocol.send_binary(message)
+                    self.protocol.send_binary(message, compress=compress)
 
         # Catch a common mistake — passing a dict to send().
 
@@ -503,6 +526,10 @@ class Connection:
         # Fragmented message — regular iterator.
 
         elif isinstance(message, Iterable):
+            if compress == "auto":
+                # Evaluating the benefit of compression requires the complete
+                # message; it cannot be done with a one-shot iterator.
+                compress = None
             chunks = iter(message)
             try:
                 chunk = next(chunks)
@@ -520,9 +547,13 @@ class Connection:
                             )
                         self.send_in_progress = True
                         if text is False:
-                            self.protocol.send_binary(chunk.encode(), fin=False)
+                            self.protocol.send_binary(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                         else:
-                            self.protocol.send_text(chunk.encode(), fin=False)
+                            self.protocol.send_text(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                     encode = True
                 elif isinstance(chunk, BytesLike):
                     with self.send_context():
@@ -533,9 +564,11 @@ class Connection:
                             )
                         self.send_in_progress = True
                         if text is True:
-                            self.protocol.send_text(chunk, fin=False)
+                            self.protocol.send_text(chunk, fin=False, compress=compress)
                         else:
-                            self.protocol.send_binary(chunk, fin=False)
+                            self.protocol.send_binary(
+                                chunk, fin=False, compress=compress
+                            )
                     encode = False
                 else:
                     raise TypeError("iterable must contain bytes or str")

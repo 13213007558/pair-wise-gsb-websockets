@@ -80,8 +80,15 @@ class PerMessageDeflate(Extension):
         # To handle continuation frames properly, we must keep track of
         # whether that initial frame was encoded.
         self.decode_cont_data = False
-        # There's no need for self.encode_cont_data because we always encode
-        # outgoing frames, so it would always be True.
+        self.encode_cont_data = False
+
+        # Compression policy for the next message, set before sending the
+        # first frame of a message and consumed when that frame is encoded:
+        # - None: default behavior, compress the message;
+        # - True: compress the message;
+        # - False: don't compress the message;
+        # - "auto": compress the message if that makes it smaller.
+        self.compress_policy: Literal[True, False, "auto"] | None = None
 
     def __repr__(self) -> str:
         return (
@@ -176,11 +183,25 @@ class PerMessageDeflate(Extension):
         if frame.opcode in CTRL_OPCODES:
             return frame
 
-        # Since we always encode messages, there's no "encode continuation
-        # data" flag similar to "decode continuation data" at this time.
+        if frame.opcode is CONT:
+            # Continuation frames inherit the policy of the first frame.
+            if not self.encode_cont_data:
+                return frame
 
-        if frame.opcode is not CONT:
-            # Re-initialize per-message decoder.
+        else:
+            # First frame of a message: apply the compression policy.
+            policy, self.compress_policy = self.compress_policy, None
+            if policy is None:
+                compress = True
+            elif policy == "auto":
+                compress = self._compress_benefits(frame)
+            else:
+                compress = policy
+            self.encode_cont_data = compress
+            if not compress:
+                return frame
+
+            # Re-initialize per-message encoder.
             if self.local_no_context_takeover:
                 self.encoder = zlib.compressobj(
                     wbits=-self.local_max_window_bits,
@@ -213,6 +234,28 @@ class PerMessageDeflate(Extension):
             frame.rsv2,
             frame.rsv3,
         )
+
+    def _compress_benefits(self, frame: Frame) -> bool:
+        """
+        Check if compressing a message makes it smaller.
+
+        Use a throwaway encoder for this trial. Even when context takeover
+        is enabled, the persistent encoder must remain untouched: if the
+        message ends up sent uncompressed, the peer never receives these
+        compressed bytes and its dictionary would desynchronize.
+
+        """
+        encoder = zlib.compressobj(
+            wbits=-self.local_max_window_bits,
+            **self.compress_settings,
+        )
+        data = encoder.compress(frame.data) + encoder.flush(zlib.Z_SYNC_FLUSH)
+        if frame.fin:
+            # Sync flush ends with the bytes 0x00 0x00 0xff 0xff, which are
+            # removed from the final frame of a compressed message.
+            assert data[-4:] == _EMPTY_UNCOMPRESSED_BLOCK
+            data = data[:-4]
+        return len(data) < len(frame.data)
 
 
 def _build_parameters(

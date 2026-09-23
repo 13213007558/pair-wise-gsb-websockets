@@ -9,6 +9,7 @@ from websockets.exceptions import (
     PayloadTooBig,
     ProtocolError,
 )
+from websockets.extensions.permessage_deflate import PerMessageDeflate
 from websockets.frames import (
     BINARY,
     CLOSE,
@@ -1884,6 +1885,70 @@ class ExtensionsTests(ProtocolTestCase):
         server.extensions = [Rsv2Extension()]
         server.receive_data(b"\xaa\x80\x00\x44\x88\xcc")
         self.assertEqual(server.events_received(), [Frame(PONG, b"")])
+
+
+class CompressionPolicyTests(ProtocolTestCase):
+    """
+    Test per-message compression policies.
+
+    """
+
+    def make_connection_with_deflate(self):
+        connection = Protocol(SERVER)
+        connection.extensions = [PerMessageDeflate(False, False, 15, 15)]
+        return connection
+
+    def test_send_text_default_policy(self):
+        connection = self.make_connection_with_deflate()
+        connection.send_text("😀".encode())
+        self.assertEqual(connection.data_to_send(), [b"\xc1\x06\xfa0\x7fF\x03\x00"])
+
+    def test_send_text_without_compression(self):
+        connection = self.make_connection_with_deflate()
+        connection.send_text("😀".encode(), compress=False)
+        self.assertEqual(connection.data_to_send(), [b"\x81\x04\xf0\x9f\x98\x80"])
+
+    def test_send_text_with_compression(self):
+        connection = self.make_connection_with_deflate()
+        connection.send_text("😀".encode(), compress=True)
+        self.assertEqual(connection.data_to_send(), [b"\xc1\x06\xfa0\x7fF\x03\x00"])
+
+    def test_send_binary_without_compression(self):
+        connection = self.make_connection_with_deflate()
+        connection.send_binary("😀".encode(), compress=False)
+        self.assertEqual(connection.data_to_send(), [b"\x82\x04\xf0\x9f\x98\x80"])
+
+    def test_send_binary_with_compression(self):
+        connection = self.make_connection_with_deflate()
+        connection.send_binary("😀".encode(), compress=True)
+        self.assertEqual(connection.data_to_send(), [b"\xc2\x06\xfa0\x7fF\x03\x00"])
+
+    def test_send_text_with_auto_compression_beneficial(self):
+        connection = self.make_connection_with_deflate()
+        connection.send_text(b"hello websocket " * 100, compress="auto")
+        (frame,) = connection.data_to_send()
+        self.assertEqual(frame[0], 0xC1)  # FIN and RSV1 set, TEXT opcode
+
+    def test_send_text_with_auto_compression_not_beneficial(self):
+        connection = self.make_connection_with_deflate()
+        connection.send_text(b"hi", compress="auto")
+        self.assertEqual(connection.data_to_send(), [b"\x81\x02hi"])
+
+    def test_send_text_with_invalid_compression_policy(self):
+        connection = self.make_connection_with_deflate()
+        with self.assertRaises(ValueError):
+            connection.send_text("😀".encode(), compress="sometimes")
+
+    def test_send_text_with_compression_policy_without_extension(self):
+        connection = Protocol(SERVER)
+        connection.send_text("😀".encode(), compress=False)
+        self.assertEqual(connection.data_to_send(), [b"\x81\x04\xf0\x9f\x98\x80"])
+
+    def test_send_text_with_compression_policy_with_other_extension(self):
+        connection = Protocol(SERVER)
+        connection.extensions = [Rsv2Extension()]
+        connection.send_text("😀".encode(), compress=False)
+        self.assertEqual(connection.data_to_send(), [b"\xa1\x04\xf0\x9f\x98\x80"])
 
 
 class MiscTests(unittest.TestCase):

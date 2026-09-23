@@ -60,6 +60,30 @@ explicitly with :class:`ClientPerMessageDeflateFactory` or
 The Window Bits and Memory Level values in these examples reduce memory usage
 at the expense of compression rate.
 
+Controlling compression per message
+-----------------------------------
+
+By default, every message is compressed. Small or already-compressed messages
+don't benefit from compression; skipping it saves CPU. You can override the
+compression policy for each message with the ``compress`` argument of
+:meth:`~websockets.asyncio.connection.Connection.send`::
+
+    # Send this message without compression.
+    await websocket.send(message, compress=False)
+
+    # Compress this message, even if it isn't beneficial.
+    await websocket.send(message, compress=True)
+
+    # Compress this message only if that makes it smaller.
+    await websocket.send(message, compress="auto")
+
+Compressed and uncompressed messages can be mixed on the same connection,
+whether or not context takeover is enabled.
+
+The ``"auto"`` policy requires the complete message to evaluate the
+benefit of compression. When sending an iterable of fragments, it falls back
+to the default behavior.
+
 Compression parameters
 ----------------------
 

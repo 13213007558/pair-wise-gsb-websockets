@@ -258,6 +258,173 @@ class PerMessageDeflateTests(unittest.TestCase, PerMessageDeflateTestsMixin):
         self.assertEqual(dec_frame1, frame)
         self.assertEqual(dec_frame2, frame)
 
+    # Per-message compression policy.
+
+    def test_encode_text_frame_without_compression(self):
+        frame = Frame(TEXT, "caf\xe9".encode())
+
+        self.extension.compress_policy = False
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_binary_frame_without_compression(self):
+        frame = Frame(BINARY, b"tea")
+
+        self.extension.compress_policy = False
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_text_frame_with_forced_compression(self):
+        frame = Frame(TEXT, "caf\xe9".encode())
+
+        self.extension.compress_policy = True
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(
+            enc_frame,
+            dataclasses.replace(frame, rsv1=True, data=b"JNL;\xbc\x12\x00"),
+        )
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_text_frame_with_auto_compression_beneficial(self):
+        frame = Frame(TEXT, b"hello websocket " * 100)
+
+        self.extension.compress_policy = "auto"
+        enc_frame = self.extension.encode(frame)
+
+        self.assertTrue(enc_frame.rsv1)
+        self.assertLess(len(enc_frame.data), len(frame.data))
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_binary_frame_with_auto_compression_not_beneficial(self):
+        frame = Frame(BINARY, os.urandom(64))
+
+        self.extension.compress_policy = "auto"
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_fragmented_text_frame_with_auto_compression(self):
+        frame1 = Frame(TEXT, b"hello websocket " * 100, fin=False)
+        frame2 = Frame(CONT, b"hello websocket " * 100)
+
+        self.extension.compress_policy = "auto"
+        enc_frame1 = self.extension.encode(frame1)
+        enc_frame2 = self.extension.encode(frame2)
+
+        self.assertTrue(enc_frame1.rsv1)
+        self.assertFalse(enc_frame2.rsv1)
+
+        dec_frame1 = self.extension.decode(enc_frame1)
+        dec_frame2 = self.extension.decode(enc_frame2)
+
+        self.assertEqual(dec_frame1, frame1)
+        self.assertEqual(dec_frame2, frame2)
+
+    def test_compress_policy_applies_to_a_single_message(self):
+        frame = Frame(TEXT, b"hello websocket " * 100)
+
+        self.extension.compress_policy = False
+        enc_frame1 = self.extension.encode(frame)
+        enc_frame2 = self.extension.encode(frame)
+
+        self.assertFalse(enc_frame1.rsv1)
+        self.assertTrue(enc_frame2.rsv1)
+
+    def test_compress_policy_unaffected_by_control_frames(self):
+        frame = Frame(TEXT, b"data")
+
+        self.extension.compress_policy = False
+        self.assertEqual(self.extension.encode(Frame(PING, b"")), Frame(PING, b""))
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+
+    def test_encode_fragmented_text_frame_without_compression(self):
+        frame1 = Frame(TEXT, "caf\xe9".encode(), fin=False)
+        frame2 = Frame(CONT, " & ".encode(), fin=False)
+        frame3 = Frame(CONT, "croissants".encode())
+
+        self.extension.compress_policy = False
+        enc_frame1 = self.extension.encode(frame1)
+        enc_frame2 = self.extension.encode(frame2)
+        enc_frame3 = self.extension.encode(frame3)
+
+        self.assertEqual(enc_frame1, frame1)
+        self.assertEqual(enc_frame2, frame2)
+        self.assertEqual(enc_frame3, frame3)
+
+        dec_frame1 = self.extension.decode(enc_frame1)
+        dec_frame2 = self.extension.decode(enc_frame2)
+        dec_frame3 = self.extension.decode(enc_frame3)
+
+        self.assertEqual(dec_frame1, frame1)
+        self.assertEqual(dec_frame2, frame2)
+        self.assertEqual(dec_frame3, frame3)
+
+    def test_encode_fragmented_text_frame_with_forced_compression(self):
+        frame1 = Frame(TEXT, "caf\xe9".encode(), fin=False)
+        frame2 = Frame(CONT, "croissants".encode())
+
+        self.extension.compress_policy = True
+        enc_frame1 = self.extension.encode(frame1)
+        enc_frame2 = self.extension.encode(frame2)
+
+        self.assertTrue(enc_frame1.rsv1)
+        self.assertFalse(enc_frame2.rsv1)
+
+        dec_frame1 = self.extension.decode(enc_frame1)
+        dec_frame2 = self.extension.decode(enc_frame2)
+
+        self.assertEqual(dec_frame1, frame1)
+        self.assertEqual(dec_frame2, frame2)
+
+    def test_auto_compression_does_not_desynchronize_context_takeover(self):
+        # Use separate extensions for encoding and decoding, like two peers.
+        encoder = PerMessageDeflate(False, False, 15, 15)
+        decoder = PerMessageDeflate(False, False, 15, 15)
+
+        message1 = b"hello websocket " * 100
+        message2 = os.urandom(100)  # doesn't benefit from compression
+        message3 = b"hello websocket " * 99 + b"hello websockets!"
+
+        enc_frame1 = encoder.encode(Frame(BINARY, message1))
+        self.assertTrue(enc_frame1.rsv1)
+
+        # The trial compression of message2 must not leak into the encoder:
+        # the decoder never receives these bytes, its dictionary would
+        # desynchronize, and decoding message3 would fail.
+        encoder.compress_policy = "auto"
+        enc_frame2 = encoder.encode(Frame(BINARY, message2))
+        self.assertEqual(enc_frame2, Frame(BINARY, message2))
+
+        enc_frame3 = encoder.encode(Frame(BINARY, message3))
+        self.assertTrue(enc_frame3.rsv1)
+
+        self.assertEqual(decoder.decode(enc_frame1).data, message1)
+        self.assertEqual(decoder.decode(enc_frame2).data, message2)
+        self.assertEqual(decoder.decode(enc_frame3).data, message3)
+
     # Compression settings can be customized.
 
     def test_compress_settings(self):

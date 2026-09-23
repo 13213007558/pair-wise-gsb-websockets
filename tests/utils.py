@@ -9,6 +9,7 @@ import time
 import unittest
 import warnings
 
+from websockets.frames import BINARY, TEXT
 from websockets.version import released
 
 
@@ -65,6 +66,41 @@ if os.environ.get("COVERAGE_RUN"):  # pragma: no branch
 
 # Ensure that timeouts are larger than the clock's resolution (for Windows).
 MS = max(MS, 2.5 * time.get_clock_info("monotonic").resolution)
+
+
+def handshake(client_protocol, server_protocol):
+    """
+    Run a real opening handshake between two Sans-I/O protocols.
+
+    """
+    request = client_protocol.connect()
+    client_protocol.send_request(request)
+    server_protocol.receive_data(b"".join(client_protocol.data_to_send()))
+    (request_event,) = server_protocol.events_received()
+    response = server_protocol.accept(request_event)
+    server_protocol.send_response(response)
+    client_protocol.receive_data(b"".join(server_protocol.data_to_send()))
+    client_protocol.events_received()
+
+
+def record_rsv1(connection):
+    """
+    Record the RSV1 bit of incoming data frames on a connection.
+
+    Return a list that grows by one boolean per incoming message.
+
+    """
+    rsv1_records = []
+    for extension in connection.protocol.extensions:
+        decode = extension.decode
+
+        def decode_and_record(frame, *, max_size=None, decode=decode):
+            if frame.opcode in (TEXT, BINARY):
+                rsv1_records.append(frame.rsv1)
+            return decode(frame, max_size=max_size)
+
+        extension.decode = decode_and_record
+    return rsv1_records
 
 
 class GeneratorTestCase(unittest.TestCase):
