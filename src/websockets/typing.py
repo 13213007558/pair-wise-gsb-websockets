@@ -3,10 +3,11 @@ from __future__ import annotations
 import http
 import logging
 import os
-from typing import Any, NewType, Sequence
+from typing import Any, Literal, NewType, Sequence
 
 
 __all__ = [
+    "Compress",
     "Data",
     "LoggerLike",
     "StatusLike",
@@ -33,6 +34,9 @@ BytesLike = bytes | bytearray | memoryview
 
 DataLike = str | bytes | bytearray | memoryview
 """Types accepted where :class:`Data` is expected."""
+
+Compress = bool | Literal["auto"] | None
+"""Compression policy for a WebSocket message."""
 
 LoggerLike = logging.Logger | logging.LoggerAdapter[Any]
 """Types accepted where a :class:`~logging.Logger` is expected."""

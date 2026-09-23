@@ -80,8 +80,10 @@ class PerMessageDeflate(Extension):
         # To handle continuation frames properly, we must keep track of
         # whether that initial frame was encoded.
         self.decode_cont_data = False
-        # There's no need for self.encode_cont_data because we always encode
-        # outgoing frames, so it would always be True.
+        # Similarly, we must keep track of whether the initial frame of a
+        # fragmented message is encoded now that messages may opt out of
+        # compression on a per-message basis.
+        self.encode_cont_data = False
 
     def __repr__(self) -> str:
         return (
@@ -167,29 +169,15 @@ class PerMessageDeflate(Extension):
             frame.rsv3,
         )
 
-    def encode(self, frame: Frame) -> Frame:
-        """
-        Encode an outgoing frame.
+    def _new_encoder(self) -> zlib.Compress:
+        return zlib.compressobj(
+            wbits=-self.local_max_window_bits,
+            **self.compress_settings,
+        )
 
-        """
-        # Skip control frames.
-        if frame.opcode in CTRL_OPCODES:
-            return frame
-
-        # Since we always encode messages, there's no "encode continuation
-        # data" flag similar to "decode continuation data" at this time.
-
-        if frame.opcode is not CONT:
-            # Re-initialize per-message decoder.
-            if self.local_no_context_takeover:
-                self.encoder = zlib.compressobj(
-                    wbits=-self.local_max_window_bits,
-                    **self.compress_settings,
-                )
-
-        # Compress data.
+    def _compress_frame(self, frame: Frame, encoder: zlib.Compress) -> BytesLike:
         data: BytesLike
-        data = self.encoder.compress(frame.data) + self.encoder.flush(zlib.Z_SYNC_FLUSH)
+        data = encoder.compress(frame.data) + encoder.flush(zlib.Z_SYNC_FLUSH)
         if frame.fin:
             # Sync flush generates between 5 or 6 bytes, ending with the bytes
             # 0x00 0x00 0xff 0xff, which must be removed.
@@ -199,6 +187,80 @@ class PerMessageDeflate(Extension):
                 data = data[:-4]
             else:
                 data = memoryview(data)[:-4]
+        return data
+
+    def _encode_auto(self, frame: Frame) -> Frame:
+        # Try compressing the message with a copy of the encoder. If the
+        # result isn't smaller than the original message, send it as-is and
+        # discard the copy. The encoder must be left untouched in this case:
+        # the peer didn't receive these compressed bytes, so committing the
+        # trial state would desynchronize the compression context.
+        if self.local_no_context_takeover:
+            encoder = self._new_encoder()
+        else:
+            encoder = self.encoder.copy()
+
+        data = self._compress_frame(frame, encoder)
+
+        if len(data) >= len(frame.data):
+            return frame
+
+        if not self.local_no_context_takeover:
+            self.encoder = encoder
+
+        return Frame(
+            frame.opcode,
+            data,
+            frame.fin,
+            # Set the rsv1 flag on the first frame of a compressed message.
+            True,
+            frame.rsv2,
+            frame.rsv3,
+        )
+
+    def encode(self, frame: Frame) -> Frame:
+        """
+        Encode an outgoing frame.
+
+        """
+        # Skip control frames.
+        if frame.opcode in CTRL_OPCODES:
+            return frame
+
+        # Handle continuation data frames:
+        # - skip if the message isn't encoded
+        # - reset "encode continuation data" flag if it's a final frame
+        if frame.opcode is CONT:
+            if not self.encode_cont_data:
+                return frame
+            if frame.fin:
+                self.encode_cont_data = False
+
+        # Handle text and binary data frames:
+        # - skip if the message must not be encoded
+        # - decide whether to encode when the policy is "auto"
+        # - set "encode continuation data" flag if it's a non-final frame
+        else:
+            compress = frame._compress
+            if compress == "auto":
+                # "auto" requires the complete message. For a fragmented
+                # message, fall back to the default behavior: compress.
+                if frame.fin:
+                    return self._encode_auto(frame)
+                compress = True
+            if compress is None:
+                compress = True
+            if not compress:
+                self.encode_cont_data = False
+                return frame
+            self.encode_cont_data = not frame.fin
+
+            # Re-initialize per-message encoder.
+            if self.local_no_context_takeover:
+                self.encoder = self._new_encoder()
+
+        # Compress data.
+        data = self._compress_frame(frame, self.encoder)
 
         # Allow garbage collection of the encoder if it won't be reused.
         if frame.fin and self.local_no_context_takeover:

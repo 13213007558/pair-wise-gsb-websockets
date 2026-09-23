@@ -222,6 +222,173 @@ class PerMessageDeflateTests(unittest.TestCase, PerMessageDeflateTestsMixin):
         self.assertEqual(enc_frame1.data, b"JNL;\xbc\x12\x00")
         self.assertEqual(enc_frame2.data, b"J\x06\x11\x00\x00")
 
+    # Outgoing frames may opt out of compression or compress selectively.
+
+    def test_encode_text_frame_uncompressed(self):
+        frame = Frame(TEXT, "café".encode())
+        frame._compress = False
+
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+        self.assertFalse(enc_frame.rsv1)
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_uncompressed_frame_preserves_context_takeover(self):
+        frame = Frame(TEXT, "café".encode())
+
+        enc_frame1 = self.extension.encode(frame)
+
+        plain_frame = Frame(TEXT, "café".encode())
+        plain_frame._compress = False
+        self.assertEqual(self.extension.encode(plain_frame), plain_frame)
+
+        enc_frame2 = self.extension.encode(frame)
+
+        # The uncompressed message didn't affect the compression context.
+        self.assertEqual(enc_frame1.data, b"JNL;\xbc\x12\x00")
+        self.assertEqual(enc_frame2.data, b"J\x06\x11\x00\x00")
+
+    def test_encode_auto_compresses_when_smaller(self):
+        frame = Frame(TEXT, b'{"message": "hello"}' * 100)
+        frame._compress = "auto"
+
+        enc_frame = self.extension.encode(frame)
+
+        self.assertTrue(enc_frame.rsv1)
+        self.assertLess(len(enc_frame.data), len(frame.data))
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_auto_doesnt_compress_when_larger(self):
+        frame = Frame(TEXT, b"{}")
+        frame._compress = "auto"
+
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+        self.assertFalse(enc_frame.rsv1)
+
+        dec_frame = self.extension.decode(enc_frame)
+
+        self.assertEqual(dec_frame, frame)
+
+    def test_encode_auto_preserves_context_takeover(self):
+        # Reproduce a typical pattern: large JSON documents are worth
+        # compressing, small heartbeats aren't.
+        document1 = Frame(TEXT, b'{"data": "' + b"x" * 1000 + b'"}')
+        document1._compress = "auto"
+        heartbeat = Frame(TEXT, b"{}")
+        heartbeat._compress = "auto"
+        document2 = Frame(TEXT, b'{"data": "' + b"x" * 1000 + b'!", "v": 2}')
+        document2._compress = "auto"
+
+        enc_document1 = self.extension.encode(document1)
+        enc_heartbeat = self.extension.encode(heartbeat)
+        enc_document2 = self.extension.encode(document2)
+
+        self.assertTrue(enc_document1.rsv1)
+        self.assertFalse(enc_heartbeat.rsv1)
+        self.assertTrue(enc_document2.rsv1)
+
+        # The peer decodes the compressed messages successfully. This fails
+        # if the trial compression of the heartbeat leaks into the encoder.
+        self.assertEqual(self.extension.decode(enc_document1), document1)
+        self.assertEqual(self.extension.decode(enc_heartbeat), heartbeat)
+        self.assertEqual(self.extension.decode(enc_document2), document2)
+
+    def test_encode_auto_no_context_takeover(self):
+        self.extension = PerMessageDeflate(True, True, 15, 15)
+
+        document1 = Frame(TEXT, b'{"data": "' + b"x" * 1000 + b'"}')
+        document1._compress = "auto"
+        heartbeat = Frame(TEXT, b"{}")
+        heartbeat._compress = "auto"
+        document2 = Frame(TEXT, b'{"data": "' + b"x" * 1000 + b'!", "v": 2}')
+        document2._compress = "auto"
+
+        enc_document1 = self.extension.encode(document1)
+        enc_heartbeat = self.extension.encode(heartbeat)
+        enc_document2 = self.extension.encode(document2)
+
+        self.assertTrue(enc_document1.rsv1)
+        self.assertFalse(enc_heartbeat.rsv1)
+        self.assertTrue(enc_document2.rsv1)
+
+        self.assertEqual(self.extension.decode(enc_document1), document1)
+        self.assertEqual(self.extension.decode(enc_heartbeat), heartbeat)
+        self.assertEqual(self.extension.decode(enc_document2), document2)
+
+    def test_encode_decode_fragmented_text_frame_uncompressed(self):
+        frame1 = Frame(TEXT, "café".encode(), fin=False)
+        frame1._compress = False
+        frame2 = Frame(CONT, " & ".encode(), fin=False)
+        frame3 = Frame(CONT, "croissants".encode())
+
+        enc_frame1 = self.extension.encode(frame1)
+        enc_frame2 = self.extension.encode(frame2)
+        enc_frame3 = self.extension.encode(frame3)
+
+        self.assertEqual(enc_frame1, frame1)
+        self.assertEqual(enc_frame2, frame2)
+        self.assertEqual(enc_frame3, frame3)
+
+        dec_frame1 = self.extension.decode(enc_frame1)
+        dec_frame2 = self.extension.decode(enc_frame2)
+        dec_frame3 = self.extension.decode(enc_frame3)
+
+        self.assertEqual(dec_frame1, frame1)
+        self.assertEqual(dec_frame2, frame2)
+        self.assertEqual(dec_frame3, frame3)
+
+    def test_encode_decode_fragmented_text_frame_with_ping(self):
+        frame1 = Frame(TEXT, "café".encode(), fin=False)
+        frame1._compress = True
+        ping = Frame(PING, b"ping")
+        frame2 = Frame(CONT, " & ".encode(), fin=False)
+        frame3 = Frame(CONT, "croissants".encode())
+
+        enc_frame1 = self.extension.encode(frame1)
+        enc_ping = self.extension.encode(ping)
+        enc_frame2 = self.extension.encode(frame2)
+        enc_frame3 = self.extension.encode(frame3)
+
+        self.assertTrue(enc_frame1.rsv1)
+        self.assertEqual(enc_ping, ping)
+        self.assertFalse(enc_frame2.rsv1)
+        self.assertFalse(enc_frame3.rsv1)
+
+        dec_frame1 = self.extension.decode(enc_frame1)
+        dec_frame2 = self.extension.decode(enc_frame2)
+        dec_frame3 = self.extension.decode(enc_frame3)
+
+        self.assertEqual(dec_frame1, frame1)
+        self.assertEqual(dec_frame2, frame2)
+        self.assertEqual(dec_frame3, frame3)
+
+    def test_encode_fragmented_text_frame_auto(self):
+        # "auto" cannot look ahead in a fragmented message; it compresses.
+        frame1 = Frame(TEXT, "café".encode(), fin=False)
+        frame1._compress = "auto"
+        frame2 = Frame(CONT, "croissants".encode())
+
+        enc_frame1 = self.extension.encode(frame1)
+        enc_frame2 = self.extension.encode(frame2)
+
+        self.assertTrue(enc_frame1.rsv1)
+        self.assertFalse(enc_frame2.rsv1)
+
+        dec_frame1 = self.extension.decode(enc_frame1)
+        dec_frame2 = self.extension.decode(enc_frame2)
+
+        self.assertEqual(dec_frame1, frame1)
+        self.assertEqual(dec_frame2, frame2)
+
     def test_remote_no_context_takeover(self):
         # No context takeover when decoding messages.
         self.extension = PerMessageDeflate(True, False, 15, 15)

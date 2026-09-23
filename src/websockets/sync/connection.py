@@ -23,8 +23,16 @@ from ..exceptions import (
 )
 from ..frames import DATA_OPCODES, PONG, CloseCode, Frame
 from ..http11 import Request, Response
-from ..protocol import CLOSED, CONNECTING, OPEN, Event, Protocol, State
-from ..typing import BytesLike, Data, DataLike, LoggerLike, Subprotocol
+from ..protocol import (
+    CLOSED,
+    CONNECTING,
+    OPEN,
+    Event,
+    Protocol,
+    State,
+    _validate_compress,
+)
+from ..typing import BytesLike, Compress, Data, DataLike, LoggerLike, Subprotocol
 from .messages import Assembler
 from .utils import Deadline
 
@@ -418,6 +426,7 @@ class Connection:
         message: DataLike | Iterable[DataLike],
         *,
         text: bool | None = None,
+        compress: Compress = None,
     ) -> None:
         """
         Send a message.
@@ -462,6 +471,13 @@ class Connection:
         Args:
             message: Message to send.
             text: Force sending in a Text_ or Binary_ frame.
+            compress: Control compression of this message when the
+                Per-Message Deflate extension is enabled. :obj:`None` applies
+                the default behavior, :obj:`True` forces compression,
+                :obj:`False` sends the message uncompressed, and `"auto"`
+                compresses a complete message only when compression reduces
+                its size. `"auto"` doesn't read fragmented messages in
+                advance; it behaves like :obj:`None` for them.
 
         Raises:
             ConnectionClosed: When the connection is closed.
@@ -469,6 +485,7 @@ class Connection:
             TypeError: If ``message`` doesn't have a supported type.
 
         """
+        _validate_compress(compress)
         self.maybe_raise_legacy_warning()
         # Unfragmented message — this case must be handled first because
         # strings and bytes-like objects are iterable.
@@ -480,9 +497,9 @@ class Connection:
                         "cannot call send while another thread is already running send"
                     )
                 if text is False:
-                    self.protocol.send_binary(message.encode())
+                    self.protocol.send_binary(message.encode(), compress=compress)
                 else:
-                    self.protocol.send_text(message.encode())
+                    self.protocol.send_text(message.encode(), compress=compress)
 
         elif isinstance(message, BytesLike):
             with self.send_context():
@@ -491,9 +508,9 @@ class Connection:
                         "cannot call send while another thread is already running send"
                     )
                 if text is True:
-                    self.protocol.send_text(message)
+                    self.protocol.send_text(message, compress=compress)
                 else:
-                    self.protocol.send_binary(message)
+                    self.protocol.send_binary(message, compress=compress)
 
         # Catch a common mistake — passing a dict to send().
 
@@ -520,9 +537,13 @@ class Connection:
                             )
                         self.send_in_progress = True
                         if text is False:
-                            self.protocol.send_binary(chunk.encode(), fin=False)
+                            self.protocol.send_binary(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                         else:
-                            self.protocol.send_text(chunk.encode(), fin=False)
+                            self.protocol.send_text(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                     encode = True
                 elif isinstance(chunk, BytesLike):
                     with self.send_context():
@@ -533,9 +554,11 @@ class Connection:
                             )
                         self.send_in_progress = True
                         if text is True:
-                            self.protocol.send_text(chunk, fin=False)
+                            self.protocol.send_text(chunk, fin=False, compress=compress)
                         else:
-                            self.protocol.send_binary(chunk, fin=False)
+                            self.protocol.send_binary(
+                                chunk, fin=False, compress=compress
+                            )
                     encode = False
                 else:
                     raise TypeError("iterable must contain bytes or str")

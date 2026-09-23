@@ -28,7 +28,7 @@ from .frames import (
 )
 from .http11 import Request, Response
 from .streams import StreamReader
-from .typing import BytesLike, LoggerLike, Origin, Subprotocol
+from .typing import BytesLike, Compress, LoggerLike, Origin, Subprotocol
 
 
 __all__ = [
@@ -66,6 +66,16 @@ CLOSED = State.CLOSED
 
 SEND_EOF = b""
 """Sentinel signaling that the TCP connection must be half-closed."""
+
+
+def _validate_compress(compress: Compress) -> None:
+    if (
+        compress is not None
+        and compress is not True
+        and compress is not False
+        and compress != "auto"
+    ):
+        raise ValueError("compress must be True, False, 'auto', or None")
 
 
 class Protocol:
@@ -315,7 +325,13 @@ class Protocol:
         self.expect_continuation_frame = not fin
         self.send_frame(Frame(CONT, data, fin))
 
-    def send_text(self, data: BytesLike, fin: bool = True) -> None:
+    def send_text(
+        self,
+        data: BytesLike,
+        fin: bool = True,
+        *,
+        compress: Compress = None,
+    ) -> None:
         """
         Send a `Text frame`_.
 
@@ -326,19 +342,30 @@ class Protocol:
             data: payload containing text encoded with UTF-8.
             fin: FIN bit; set it to :obj:`False` if this is the first frame of
                 a fragmented message.
+            compress: compression policy for this message; :obj:`None` applies
+                the default behavior, :obj:`True` forces compression,
+                :obj:`False` disables compression, and `"auto"` compresses a
+                complete message only when that reduces its size.
 
         Raises:
             ProtocolError: If a fragmented message is in progress.
 
         """
+        _validate_compress(compress)
         if self.expect_continuation_frame:
             raise ProtocolError("expected a continuation frame")
         if self._state is not OPEN:
             raise InvalidState(f"connection is {self.state.name.lower()}")
         self.expect_continuation_frame = not fin
-        self.send_frame(Frame(TEXT, data, fin))
+        self.send_frame(Frame(TEXT, data, fin), compress=compress)
 
-    def send_binary(self, data: BytesLike, fin: bool = True) -> None:
+    def send_binary(
+        self,
+        data: BytesLike,
+        fin: bool = True,
+        *,
+        compress: Compress = None,
+    ) -> None:
         """
         Send a `Binary frame`_.
 
@@ -349,17 +376,22 @@ class Protocol:
             data: payload containing arbitrary binary data.
             fin: FIN bit; set it to :obj:`False` if this is the first frame of
                 a fragmented message.
+            compress: compression policy for this message; :obj:`None` applies
+                the default behavior, :obj:`True` forces compression,
+                :obj:`False` disables compression, and `"auto"` compresses a
+                complete message only when that reduces its size.
 
         Raises:
             ProtocolError: If a fragmented message is in progress.
 
         """
+        _validate_compress(compress)
         if self.expect_continuation_frame:
             raise ProtocolError("expected a continuation frame")
         if self._state is not OPEN:
             raise InvalidState(f"connection is {self.state.name.lower()}")
         self.expect_continuation_frame = not fin
-        self.send_frame(Frame(BINARY, data, fin))
+        self.send_frame(Frame(BINARY, data, fin), compress=compress)
 
     def send_close(self, code: CloseCode | int | None = None, reason: str = "") -> None:
         """
@@ -750,9 +782,10 @@ class Protocol:
 
     # Private methods for sending events.
 
-    def send_frame(self, frame: Frame) -> None:
+    def send_frame(self, frame: Frame, *, compress: Compress = None) -> None:
         if self.debug:
             self.logger.debug("> %s", frame)
+        frame._compress = compress
         self.writes.append(
             frame.serialize(
                 mask=self.side is CLIENT,

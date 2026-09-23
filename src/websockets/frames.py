@@ -10,7 +10,7 @@ from collections.abc import Generator, Sequence
 from typing import Callable, Self
 
 from .exceptions import PayloadTooBig, ProtocolError
-from .typing import BytesLike
+from .typing import BytesLike, Compress
 
 
 try:
@@ -135,6 +135,12 @@ class Frame:
     rsv1: bool = False
     rsv2: bool = False
     rsv3: bool = False
+    _compress: Compress | None = dataclasses.field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     # Configure if you want to see more in logs. Should be a multiple of 3.
     MAX_LOG_SIZE = int(os.environ.get("WEBSOCKETS_MAX_LOG_SIZE", "75"))

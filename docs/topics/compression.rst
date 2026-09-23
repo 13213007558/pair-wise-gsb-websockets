@@ -60,6 +60,37 @@ explicitly with :class:`ClientPerMessageDeflateFactory` or
 The Window Bits and Memory Level values in these examples reduce memory usage
 at the expense of compression rate.
 
+Compressing messages selectively
+--------------------------------
+
+Compressing small messages such as heartbeats usually costs more CPU than it
+saves bandwidth. The ``compress`` argument of
+:meth:`~websockets.asyncio.connection.Connection.send` selects a compression
+policy for each message:
+
+* ``compress=True`` compresses the message, even if it expands;
+* ``compress=False`` sends the message as-is;
+* ``compress="auto"`` compresses a complete :class:`str` or :class:`bytes`
+  message only when the compressed form is smaller.
+
+For example, to compress large JSON documents while sending small heartbeats
+as-is::
+
+    await websocket.send(json.dumps(document), compress="auto")
+    await websocket.send("{}", compress=False)
+
+Compressed and uncompressed messages may be interleaved freely on the same
+connection, including when context takeover is enabled.
+
+For fragmented messages sent as an iterable, the policy of the first fragment
+applies to the whole message. Since an iterator cannot be read in advance,
+``compress="auto"`` doesn't attempt to decide whether compression is worth
+it; it behaves like the default and compresses. Control frames are never
+compressed.
+
+When ``compress`` isn't provided, every message is compressed, preserving the
+default behavior.
+
 Compression parameters
 ----------------------
 

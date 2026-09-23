@@ -77,6 +77,7 @@ __all__ = [
     # .server
     "ServerProtocol",
     # .typing
+    "Compress",
     "Data",
     "ExtensionName",
     "ExtensionParameter",
@@ -139,6 +140,7 @@ if TYPE_CHECKING:
     from .protocol import Protocol, Side, State
     from .server import ServerProtocol
     from .typing import (
+        Compress,
         Data,
         ExtensionName,
         ExtensionParameter,
@@ -220,6 +222,7 @@ else:
             # .server
             "ServerProtocol": ".server",
             # .typing
+            "Compress": ".typing",
             "Data": ".typing",
             "ExtensionName": ".typing",
             "ExtensionParameter": ".typing",

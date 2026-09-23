@@ -21,8 +21,8 @@ from ..exceptions import (
 )
 from ..frames import DATA_OPCODES, PONG, CloseCode, Frame
 from ..http11 import Request, Response
-from ..protocol import CLOSED, OPEN, Event, Protocol, State
-from ..typing import BytesLike, Data, DataLike, LoggerLike, Subprotocol
+from ..protocol import CLOSED, OPEN, Event, Protocol, State, _validate_compress
+from ..typing import BytesLike, Compress, Data, DataLike, LoggerLike, Subprotocol
 from .messages import Assembler
 
 
@@ -398,6 +398,7 @@ class Connection(asyncio.Protocol):
         message: DataLike | Iterable[DataLike] | AsyncIterable[DataLike],
         *,
         text: bool | None = None,
+        compress: Compress = None,
     ) -> None:
         """
         Send a message.
@@ -455,12 +456,21 @@ class Connection(asyncio.Protocol):
         Args:
             message: Message to send.
             text: Force sending in a Text_ or Binary_ frame.
+            compress: Control compression of this message when the
+                Per-Message Deflate extension is enabled. :obj:`None` applies
+                the default behavior, :obj:`True` forces compression,
+                :obj:`False` sends the message uncompressed, and `"auto"`
+                compresses a complete message only when compression reduces
+                its size. `"auto"` doesn't read fragmented messages in
+                advance; it behaves like :obj:`None` for them.
 
         Raises:
             ConnectionClosed: When the connection is closed.
             TypeError: If ``message`` doesn't have a supported type.
 
         """
+        _validate_compress(compress)
+
         # While sending a fragmented message, prevent sending other messages
         # until all fragments are sent.
         while self.send_in_progress is not None:
@@ -472,16 +482,16 @@ class Connection(asyncio.Protocol):
         if isinstance(message, str):
             async with self.send_context():
                 if text is False:
-                    self.protocol.send_binary(message.encode())
+                    self.protocol.send_binary(message.encode(), compress=compress)
                 else:
-                    self.protocol.send_text(message.encode())
+                    self.protocol.send_text(message.encode(), compress=compress)
 
         elif isinstance(message, BytesLike):
             async with self.send_context():
                 if text is True:
-                    self.protocol.send_text(message)
+                    self.protocol.send_text(message, compress=compress)
                 else:
-                    self.protocol.send_binary(message)
+                    self.protocol.send_binary(message, compress=compress)
 
         # Catch a common mistake — passing a dict to send().
 
@@ -504,16 +514,22 @@ class Connection(asyncio.Protocol):
                 if isinstance(chunk, str):
                     async with self.send_context():
                         if text is False:
-                            self.protocol.send_binary(chunk.encode(), fin=False)
+                            self.protocol.send_binary(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                         else:
-                            self.protocol.send_text(chunk.encode(), fin=False)
+                            self.protocol.send_text(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                     encode = True
                 elif isinstance(chunk, BytesLike):
                     async with self.send_context():
                         if text is True:
-                            self.protocol.send_text(chunk, fin=False)
+                            self.protocol.send_text(chunk, fin=False, compress=compress)
                         else:
-                            self.protocol.send_binary(chunk, fin=False)
+                            self.protocol.send_binary(
+                                chunk, fin=False, compress=compress
+                            )
                     encode = False
                 else:
                     raise TypeError("iterable must contain bytes or str")
@@ -563,18 +579,24 @@ class Connection(asyncio.Protocol):
                 if isinstance(chunk, str):
                     if text is False:
                         async with self.send_context():
-                            self.protocol.send_binary(chunk.encode(), fin=False)
+                            self.protocol.send_binary(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                     else:
                         async with self.send_context():
-                            self.protocol.send_text(chunk.encode(), fin=False)
+                            self.protocol.send_text(
+                                chunk.encode(), fin=False, compress=compress
+                            )
                     encode = True
                 elif isinstance(chunk, BytesLike):
                     if text is True:
                         async with self.send_context():
-                            self.protocol.send_text(chunk, fin=False)
+                            self.protocol.send_text(chunk, fin=False, compress=compress)
                     else:
                         async with self.send_context():
-                            self.protocol.send_binary(chunk, fin=False)
+                            self.protocol.send_binary(
+                                chunk, fin=False, compress=compress
+                            )
                     encode = False
                 else:
                     raise TypeError("async iterable must contain bytes or str")
