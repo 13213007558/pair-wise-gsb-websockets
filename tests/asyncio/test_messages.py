@@ -376,6 +376,223 @@ class AssemblerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConcurrencyError):
             await alist(self.assembler.get_iter())
 
+    # Test get_reader.
+
+    async def test_get_reader_text_message(self):
+        """get_reader reads a text message in chunks."""
+        self.assembler.put(Frame(TEXT, b"caf\xc3\xa9"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(2), "ca")
+        self.assertEqual(await reader.read(1), "f")
+        self.assertEqual(await reader.read(2), "é")
+        self.assertEqual(await reader.read(1), "")
+
+    async def test_get_reader_binary_message(self):
+        """get_reader reads a binary message in chunks."""
+        self.assembler.put(Frame(BINARY, b"tea"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(2), b"te")
+        self.assertEqual(await reader.read(2), b"a")
+        self.assertEqual(await reader.read(1), b"")
+
+    async def test_get_reader_fragmented_text_message(self):
+        """get_reader decodes UTF-8 across frames of a fragmented message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        self.assembler.put(Frame(CONT, b"f\xc3", fin=False))
+        self.assembler.put(Frame(CONT, b"\xa9"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(3), "caf")
+        self.assertEqual(await reader.read(1), "é")
+        self.assertEqual(await reader.read(1), "")
+
+    async def test_get_reader_fragmented_binary_message(self):
+        """get_reader reads a fragmented binary message in chunks."""
+        self.assembler.put(Frame(BINARY, b"t", fin=False))
+        self.assembler.put(Frame(CONT, b"e", fin=False))
+        self.assembler.put(Frame(CONT, b"a"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(2), b"te")
+        self.assertEqual(await reader.read(2), b"a")
+        self.assertEqual(await reader.read(1), b"")
+
+    async def test_get_reader_encoded_text_message(self):
+        """get_reader returns a text message without UTF-8 decoding."""
+        self.assembler.put(Frame(TEXT, b"caf\xc3\xa9"))
+        reader = await self.assembler.get_reader(decode=False)
+        self.assertEqual(await reader.read(4), b"caf\xc3")
+        self.assertEqual(await reader.read(4), b"\xa9")
+
+    async def test_get_reader_decoded_binary_message(self):
+        """get_reader returns a binary message with UTF-8 decoding."""
+        self.assembler.put(Frame(BINARY, b"tea"))
+        reader = await self.assembler.get_reader(decode=True)
+        self.assertEqual(await reader.read(4), "tea")
+
+    async def test_get_reader_message_not_received_yet(self):
+        """get_reader returns a reader when the message is received."""
+        reader_task = asyncio.create_task(self.assembler.get_reader())
+        await asyncio.sleep(0)  # let the event loop start reader_task
+        self.assembler.put(Frame(TEXT, b"caf\xc3\xa9"))
+        reader = await reader_task
+        self.assertEqual(await reader.read(4), "café")
+
+    async def test_reader_read_frame_not_received_yet(self):
+        """read waits for the next frame of a fragmented message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(2), "ca")
+        read_task = asyncio.create_task(reader.read(2))
+        await asyncio.sleep(0)  # let the event loop start read_task
+        self.assembler.put(Frame(CONT, b"f\xc3", fin=False))
+        self.assembler.put(Frame(CONT, b"\xa9"))
+        self.assertEqual(await read_task, "fé")
+
+    async def test_reader_read_cancellation_before_consuming_frame(self):
+        """read can be canceled before consuming a new frame."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(2), "ca")
+        read_task = asyncio.create_task(reader.read(2))
+        await asyncio.sleep(0)  # let the event loop start read_task
+        read_task.cancel()
+        await asyncio.sleep(0)  # let the event loop cancel read_task
+
+        # Running read again returns the same data.
+        self.assembler.put(Frame(CONT, b"f\xc3", fin=False))
+        self.assembler.put(Frame(CONT, b"\xa9"))
+        self.assertEqual(await reader.read(2), "fé")
+
+    async def test_reader_discard(self):
+        """discard skips the rest of the message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        self.assembler.put(Frame(CONT, b"f\xc3", fin=False))
+        self.assembler.put(Frame(CONT, b"\xa9"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(1), "c")
+        await reader.discard()
+
+        # The assembler reads the next message.
+        self.assembler.put(Frame(TEXT, b"tea"))
+        message = await self.assembler.get()
+        self.assertEqual(message, "tea")
+
+    async def test_reader_discard_validates_utf8(self):
+        """discard checks UTF-8 in the discarded part of a text message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        self.assembler.put(Frame(CONT, b"f\xff"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(2), "ca")
+        with self.assertRaises(UnicodeDecodeError):
+            await reader.discard()
+
+    async def test_reader_discard_validates_utf8_at_frame_boundary(self):
+        """discard detects a truncated multi-byte character at the end."""
+        self.assembler.put(Frame(TEXT, b"caf\xc3", fin=False))
+        self.assembler.put(Frame(CONT, b""))
+        reader = await self.assembler.get_reader()
+        with self.assertRaises(UnicodeDecodeError):
+            await reader.discard()
+
+    async def test_reader_discard_calls_fail(self):
+        """discard calls fail when a text message contains invalid UTF-8."""
+        self.assembler.put(Frame(TEXT, b"\xff"))
+        fail = unittest.mock.AsyncMock()
+        reader = await self.assembler.get_reader(fail=fail)
+        with self.assertRaises(UnicodeDecodeError):
+            await reader.discard()
+        fail.assert_awaited_once()
+
+    async def test_reader_read_eof(self):
+        """read raises EOFError when the stream of frames ends mid-message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        reader = await self.assembler.get_reader()
+        self.assembler.close()
+        with self.assertRaises(EOFError):
+            await reader.read(4)
+
+    async def test_reader_read_eof_calls_eof(self):
+        """read calls eof when the stream of frames ends mid-message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        eof = unittest.mock.AsyncMock()
+        reader = await self.assembler.get_reader(eof=eof)
+        self.assembler.close()
+        with self.assertRaises(EOFError):
+            await reader.read(4)
+        eof.assert_awaited_once()
+
+    async def test_reader_discard_eof(self):
+        """discard raises EOFError when the stream of frames ends mid-message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        reader = await self.assembler.get_reader()
+        self.assembler.close()
+        with self.assertRaises(EOFError):
+            await reader.discard()
+
+    async def test_reader_releases_message_when_read(self):
+        """get can be called after a message is read entirely."""
+        self.assembler.put(Frame(TEXT, b"caf\xc3\xa9"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(4), "café")
+
+        self.assembler.put(Frame(TEXT, b"tea"))
+        message = await self.assembler.get()
+        self.assertEqual(message, "tea")
+
+    async def test_reader_blocks_get_until_discarded(self):
+        """get cannot be called while a reader holds a message."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+        reader = await self.assembler.get_reader()
+        with self.assertRaises(ConcurrencyError):
+            await self.assembler.get()
+        with self.assertRaises(ConcurrencyError):
+            await alist(self.assembler.get_iter())
+        with self.assertRaises(ConcurrencyError):
+            await self.assembler.get_reader()
+
+        self.assembler.put(Frame(CONT, b"f\xc3\xa9"))
+        await reader.discard()
+
+        self.assembler.put(Frame(TEXT, b"tea"))
+        message = await self.assembler.get()
+        self.assertEqual(message, "tea")
+
+    async def test_cancel_get_reader_before_first_frame(self):
+        """get_reader can be canceled safely before reading the first frame."""
+        reader_task = asyncio.create_task(self.assembler.get_reader())
+        await asyncio.sleep(0)  # let the event loop start reader_task
+        reader_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await reader_task
+
+        self.assembler.put(Frame(TEXT, b"caf\xc3\xa9"))
+        reader = await self.assembler.get_reader()
+        self.assertEqual(await reader.read(4), "café")
+
+    async def test_get_reader_fails_when_interrupted_by_close(self):
+        """get_reader raises EOFError when close is called."""
+        asyncio.get_running_loop().call_soon(self.assembler.close)
+        with self.assertRaises(EOFError):
+            await self.assembler.get_reader()
+
+    async def test_get_reader_resumes_reading(self):
+        """get_reader resumes reading when queue goes below the low-water mark."""
+        self.assembler.put(Frame(TEXT, b"caf\xc3\xa9"))
+        self.assembler.put(Frame(TEXT, b"more caf\xc3\xa9"))
+        self.assembler.put(Frame(TEXT, b"water"))
+
+        # queue is above the low-water mark
+        reader = await self.assembler.get_reader()
+        self.resume.assert_not_called()
+        await reader.discard()
+        # queue is at the low-water mark
+        reader = await self.assembler.get_reader()
+        self.resume.assert_called_once_with()
+        await reader.discard()
+        # queue is below the low-water mark
+        reader = await self.assembler.get_reader()
+        self.resume.assert_called_once_with()
+        await reader.discard()
+
     # Test put.
 
     async def test_put_pauses_reading(self):

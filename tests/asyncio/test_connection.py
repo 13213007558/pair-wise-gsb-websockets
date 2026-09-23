@@ -16,6 +16,7 @@ from websockets.exceptions import (
     ConnectionClosedError,
     ConnectionClosedOK,
 )
+from websockets.extensions.permessage_deflate import PerMessageDeflate
 from websockets.frames import BINARY, CLOSE, CONT, PING, PONG, TEXT, CloseCode, Frame
 from websockets.protocol import CLIENT, CLOSED, OPEN, SERVER, Protocol
 
@@ -229,8 +230,8 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
             recv_task.cancel()
         self.assertEqual(
             str(raised.exception),
-            "cannot call recv while another coroutine "
-            "is already running recv or recv_streaming",
+            "cannot call recv while another coroutine is already "
+            "running recv, recv_reader, or recv_streaming",
         )
 
     async def test_recv_during_recv_streaming(self):
@@ -246,8 +247,8 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
             recv_streaming_task.cancel()
         self.assertEqual(
             str(raised.exception),
-            "cannot call recv while another coroutine "
-            "is already running recv or recv_streaming",
+            "cannot call recv while another coroutine is already "
+            "running recv, recv_reader, or recv_streaming",
         )
 
     async def test_recv_cancellation_before_receiving(self):
@@ -368,8 +369,8 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
             recv_task.cancel()
         self.assertEqual(
             str(raised.exception),
-            "cannot call recv_streaming while another coroutine "
-            "is already running recv or recv_streaming",
+            "cannot call recv_streaming while another coroutine is "
+            "already running recv, recv_reader, or recv_streaming",
         )
 
     async def test_recv_streaming_during_recv_streaming(self):
@@ -386,8 +387,8 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
             recv_streaming_task.cancel()
         self.assertEqual(
             str(raised.exception),
-            "cannot call recv_streaming while another coroutine "
-            "is already running recv or recv_streaming",
+            "cannot call recv_streaming while another coroutine is "
+            "already running recv, recv_reader, or recv_streaming",
         )
 
     async def test_recv_streaming_cancellation_before_receiving(self):
@@ -434,6 +435,225 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ConcurrencyError):
             async for _ in self.connection.recv_streaming():
                 self.fail("did not raise")
+
+    # Test recv_reader.
+
+    async def test_recv_reader_text(self):
+        """recv_reader reads a text message."""
+        await self.remote_connection.send("😀")
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(1), "😀")
+        self.assertEqual(await reader.read(1), "")
+
+    async def test_recv_reader_binary(self):
+        """recv_reader reads a binary message."""
+        await self.remote_connection.send(b"\x01\x02\xfe\xff")
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(2), b"\x01\x02")
+        self.assertEqual(await reader.read(2), b"\xfe\xff")
+        self.assertEqual(await reader.read(1), b"")
+
+    async def test_recv_reader_text_as_bytes(self):
+        """recv_reader reads a text message as bytes."""
+        await self.remote_connection.send("😀")
+        reader = await self.connection.recv_reader(decode=False)
+        self.assertEqual(await reader.read(4), "😀".encode())
+
+    async def test_recv_reader_fragmented_text(self):
+        """recv_reader decodes UTF-8 across frames of a fragmented message."""
+        await self.remote_connection.send([b"caf\xc3", b"\xa9"], text=True)
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(4), "café")
+        self.assertEqual(await reader.read(1), "")
+
+    async def test_recv_reader_discard_then_recv(self):
+        """recv returns the next message after the reader discards a message."""
+        await self.remote_connection.send(b"\x00" * 64)
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(32), b"\x00" * 32)
+        await reader.discard()
+
+        await self.remote_connection.send("😀")
+        self.assertEqual(await self.connection.recv(), "😀")
+
+    async def test_recv_reader_discard_fragmented_with_ping(self):
+        """discard processes a ping received between fragments."""
+
+        async def fragments():
+            yield "⏳"
+            await self.remote_connection.ping(b"ping")
+            yield "😀"
+
+        asyncio.create_task(self.remote_connection.send(fragments()))
+        await asyncio.sleep(0)
+
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(1), "⏳")
+        await reader.discard()
+
+        # The ping was answered while discarding the message.
+        await self.assertFrameSent(Frame(PONG, b"ping"))
+
+        await self.remote_connection.send("🙂")
+        self.assertEqual(await self.connection.recv(), "🙂")
+
+    async def test_recv_reader_discard_compressed_message(self):
+        """discard decompresses a compressed message instead of skipping it."""
+        self.connection.protocol.extensions = [PerMessageDeflate(False, False, 15, 15)]
+        self.remote_connection.protocol.extensions = [
+            PerMessageDeflate(False, False, 15, 15)
+        ]
+
+        await self.remote_connection.send("😀" * 64)
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(32), "😀" * 32)
+        await reader.discard()
+
+        await self.remote_connection.send("🙂")
+        self.assertEqual(await self.connection.recv(), "🙂")
+
+    async def test_recv_reader_max_size(self):
+        """max_size applies to the entire message when discarding."""
+        self.connection.protocol.max_message_size = 4
+        await self.remote_connection.send(["aaaa", "bbbb"])
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(2), "aa")
+        with self.assertRaises(ConnectionClosedError) as raised:
+            await reader.discard()
+        self.assertEqual(raised.exception.sent.code, CloseCode.MESSAGE_TOO_BIG)
+
+    async def test_recv_reader_compressed_max_size(self):
+        """max_size applies to the decoded size of a compressed message."""
+        self.connection.protocol.extensions = [PerMessageDeflate(False, False, 15, 15)]
+        self.remote_connection.protocol.extensions = [
+            PerMessageDeflate(False, False, 15, 15)
+        ]
+        self.connection.protocol.max_message_size = 16
+
+        await self.remote_connection.send("😀" * 64)
+        with self.assertRaises(ConnectionClosedError) as raised:
+            await self.connection.recv_reader()
+        self.assertEqual(raised.exception.sent.code, CloseCode.MESSAGE_TOO_BIG)
+
+    async def test_recv_reader_discard_non_utf8_text(self):
+        """discard fails the connection when a text message isn't UTF-8."""
+        await self.remote_connection.send([b"ca", b"\xff"], text=True)
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(2), "ca")
+        with self.assertRaises(ConnectionClosedError) as raised:
+            await reader.discard()
+        self.assertEqual(raised.exception.sent.code, CloseCode.INVALID_DATA)
+
+    async def test_recv_reader_discard_bad_continuation(self):
+        """discard closes the connection upon an invalid continuation frame."""
+        self.remote_connection.protocol.send_text(b"ca", fin=False)
+        self.remote_connection.send_data()
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(2), "ca")
+
+        # Send a text frame instead of a continuation frame.
+        self.remote_connection.protocol.send_frame(Frame(TEXT, b"fe"))
+        self.remote_connection.send_data()
+        with self.assertRaises(ConnectionClosedError) as raised:
+            await reader.discard()
+        self.assertEqual(raised.exception.sent.code, CloseCode.PROTOCOL_ERROR)
+
+        # The connection is closed; it didn't resynchronize.
+        with self.assertRaises(ConnectionClosedError):
+            await self.connection.recv()
+
+    async def test_recv_reader_connection_closed_ok(self):
+        """recv_reader raises ConnectionClosedOK after a normal closure."""
+        await self.remote_connection.close()
+        with self.assertRaises(ConnectionClosedOK):
+            await self.connection.recv_reader()
+
+    async def test_recv_reader_read_connection_closed(self):
+        """read raises ConnectionClosedError when the connection drops."""
+        gate = asyncio.Event()
+
+        async def fragments():
+            yield "⏳"
+            await gate.wait()
+            yield "😀"
+
+        asyncio.create_task(self.remote_connection.send(fragments()))
+        await asyncio.sleep(0)
+
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(1), "⏳")
+
+        await self.remote_connection.close(code=CloseCode.INTERNAL_ERROR)
+        gate.set()
+        with self.assertRaises(ConnectionClosedError):
+            await reader.read(1)
+
+    async def test_recv_during_recv_reader(self):
+        """recv raises ConcurrencyError when a reader holds a message."""
+        await self.remote_connection.send("😀")
+        reader = await self.connection.recv_reader()
+        try:
+            with self.assertRaises(ConcurrencyError) as raised:
+                await self.connection.recv()
+        finally:
+            await reader.discard()
+        self.assertEqual(
+            str(raised.exception),
+            "cannot call recv while another coroutine is already "
+            "running recv, recv_reader, or recv_streaming",
+        )
+
+    async def test_recv_reader_during_recv(self):
+        """recv_reader raises ConcurrencyError when called concurrently."""
+        recv_task = asyncio.create_task(self.connection.recv())
+        await asyncio.sleep(0)  # let the event loop start recv_task
+        try:
+            with self.assertRaises(ConcurrencyError) as raised:
+                await self.connection.recv_reader()
+        finally:
+            recv_task.cancel()
+        self.assertEqual(
+            str(raised.exception),
+            "cannot call recv_reader while another coroutine is already "
+            "running recv, recv_reader, or recv_streaming",
+        )
+
+    async def test_recv_reader_cancellation_before_receiving(self):
+        """recv_reader can be canceled before receiving a message."""
+        reader_task = asyncio.create_task(self.connection.recv_reader())
+        await asyncio.sleep(0)  # let the event loop start reader_task
+        reader_task.cancel()
+        await asyncio.sleep(0)  # let the event loop cancel reader_task
+
+        # Running recv_reader again reads the next message.
+        await self.remote_connection.send("😀")
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(1), "😀")
+
+    async def test_recv_reader_read_cancellation(self):
+        """read can be canceled before consuming a new frame."""
+        gate = asyncio.Event()
+
+        async def fragments():
+            yield "⏳"
+            await gate.wait()
+            yield "😀"
+
+        asyncio.create_task(self.remote_connection.send(fragments()))
+        await asyncio.sleep(0)
+
+        reader = await self.connection.recv_reader()
+        self.assertEqual(await reader.read(1), "⏳")
+
+        read_task = asyncio.create_task(reader.read(1))
+        await asyncio.sleep(0)  # let the event loop start read_task
+        read_task.cancel()
+        await asyncio.sleep(0)  # let the event loop cancel read_task
+
+        gate.set()
+
+        # Running read again returns the same data.
+        self.assertEqual(await reader.read(1), "😀")
 
     # Test send.
 

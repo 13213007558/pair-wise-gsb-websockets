@@ -19,6 +19,8 @@ Using a connection
 
     .. automethod:: recv
 
+    .. automethod:: recv_reader
+
     .. automethod:: recv_streaming
 
     .. automethod:: send

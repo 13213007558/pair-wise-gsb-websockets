@@ -23,7 +23,7 @@ from ..frames import DATA_OPCODES, PONG, CloseCode, Frame
 from ..http11 import Request, Response
 from ..protocol import CLOSED, OPEN, Event, Protocol, State
 from ..typing import BytesLike, Data, DataLike, LoggerLike, Subprotocol
-from .messages import Assembler
+from .messages import Assembler, MessageReader
 
 
 __all__ = ["Connection"]
@@ -290,8 +290,8 @@ class Connection(asyncio.Protocol):
 
         Raises:
             ConnectionClosed: When the connection is closed.
-            ConcurrencyError: If two coroutines call :meth:`recv` or
-                :meth:`recv_streaming` concurrently.
+            ConcurrencyError: If two coroutines call :meth:`recv`,
+                :meth:`recv_reader`, or :meth:`recv_streaming` concurrently.
 
         """
         try:
@@ -301,8 +301,8 @@ class Connection(asyncio.Protocol):
             # fallthrough
         except ConcurrencyError:
             raise ConcurrencyError(
-                "cannot call recv while another coroutine "
-                "is already running recv or recv_streaming"
+                "cannot call recv while another coroutine is already "
+                "running recv, recv_reader, or recv_streaming"
             ) from None
         except UnicodeDecodeError as exc:
             async with self.send_context():
@@ -365,8 +365,8 @@ class Connection(asyncio.Protocol):
 
         Raises:
             ConnectionClosed: When the connection is closed.
-            ConcurrencyError: If two coroutines call :meth:`recv` or
-                :meth:`recv_streaming` concurrently.
+            ConcurrencyError: If two coroutines call :meth:`recv`,
+                :meth:`recv_reader`, or :meth:`recv_streaming` concurrently.
 
         """
         try:
@@ -378,8 +378,8 @@ class Connection(asyncio.Protocol):
             # fallthrough
         except ConcurrencyError:
             raise ConcurrencyError(
-                "cannot call recv_streaming while another coroutine "
-                "is already running recv or recv_streaming"
+                "cannot call recv_streaming while another coroutine is "
+                "already running recv, recv_reader, or recv_streaming"
             ) from None
         except UnicodeDecodeError as exc:
             async with self.send_context():
@@ -388,6 +388,84 @@ class Connection(asyncio.Protocol):
                     f"{exc.reason} at position {exc.start}",
                 )
             # fallthrough
+
+        # Wait for the protocol state to be CLOSED before accessing close_exc.
+        await asyncio.shield(self.connection_lost_waiter)
+        raise self.protocol.close_exc from self.recv_exc
+
+    async def recv_reader(self, decode: bool | None = None) -> MessageReader:
+        """
+        Receive the next message as a reader.
+
+        This method is designed for receiving messages when you want to
+        inspect the beginning of the message before deciding whether to
+        consume it entirely or to discard it and wait for the next message.
+        It returns a :class:`~websockets.asyncio.messages.MessageReader`.
+
+        The reader provides two methods:
+
+        * :meth:`~websockets.asyncio.messages.MessageReader.read` reads up to
+          a given number of bytes or characters;
+        * :meth:`~websockets.asyncio.messages.MessageReader.discard` skips the
+          rest of the message, while continuing to process ping, pong, and
+          protocol errors, validating UTF-8 in text messages, and keeping
+          the state of decompression consistent.
+
+        Until the message is entirely read or discarded, calling
+        :meth:`recv`, :meth:`recv_reader`, or :meth:`recv_streaming` raises
+        :exc:`~websockets.exceptions.ConcurrencyError`.
+
+        Canceling :meth:`recv_reader` is safe. There's no risk of losing data.
+        The next invocation will return a reader for the same message.
+
+        Canceling :meth:`~websockets.asyncio.messages.MessageReader.read`
+        before it starts consuming data from a new frame is also safe. Once
+        it returns data, the position in the message advances accordingly;
+        you may continue reading or discard the rest of the message.
+
+        The ``max_size`` limit applies to the entire decoded message, even
+        when parts of the message are discarded.
+
+        Args:
+            decode: Set this flag to override the default behavior of
+                providing :class:`str` or :class:`bytes`. See :meth:`recv` for
+                details.
+
+        Returns:
+            A reader for the next message.
+
+        Raises:
+            ConnectionClosed: When the connection is closed.
+            ConcurrencyError: If two coroutines call :meth:`recv`,
+                :meth:`recv_reader`, or :meth:`recv_streaming` concurrently.
+
+        """
+
+        async def fail(exc: UnicodeDecodeError) -> None:
+            async with self.send_context():
+                self.protocol.fail(
+                    CloseCode.INVALID_DATA,
+                    f"{exc.reason} at position {exc.start}",
+                )
+            # Wait for the protocol state to be CLOSED before accessing close_exc.
+            await asyncio.shield(self.connection_lost_waiter)
+            raise self.protocol.close_exc from self.recv_exc
+
+        async def eof() -> None:
+            # Wait for the protocol state to be CLOSED before accessing close_exc.
+            await asyncio.shield(self.connection_lost_waiter)
+            raise self.protocol.close_exc from self.recv_exc
+
+        try:
+            return await self.recv_messages.get_reader(decode, fail, eof)
+        except EOFError:
+            pass
+            # fallthrough
+        except ConcurrencyError:
+            raise ConcurrencyError(
+                "cannot call recv_reader while another coroutine is already "
+                "running recv, recv_reader, or recv_streaming"
+            ) from None
 
         # Wait for the protocol state to be CLOSED before accessing close_exc.
         await asyncio.shield(self.connection_lost_waiter)
