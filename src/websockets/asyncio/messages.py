@@ -11,7 +11,7 @@ from ..frames import BINARY, CONT, TEXT, Frame
 from ..typing import Data
 
 
-__all__ = ["Assembler"]
+__all__ = ["Assembler", "MessageReader"]
 
 UTF8Decoder = codecs.getincrementaldecoder("utf-8")
 
@@ -263,6 +263,50 @@ class Assembler:
 
         self.get_in_progress = False
 
+    async def get_reader(self, decode: bool | None = None) -> MessageReader:
+        """
+        Read the next message incrementally.
+
+        :meth:`get_reader` returns a :class:`MessageReader`. Its
+        :meth:`MessageReader.read` method fetches the message chunk by chunk;
+        its :meth:`MessageReader.discard` method skips the rest of the
+        message.
+
+        The message must be fully read or discarded before calling
+        :meth:`get`, :meth:`get_iter`, or :meth:`get_reader` again. Else,
+        :exc:`ConcurrencyError` is raised.
+
+        Args:
+            decode: :obj:`False` disables UTF-8 decoding of text frames and
+                reads :class:`bytes`. :obj:`True` forces UTF-8 decoding of
+                binary frames and reads :class:`str`.
+
+        Raises:
+            EOFError: If the stream of frames has ended.
+            UnicodeDecodeError: If a text frame contains invalid UTF-8.
+            ConcurrencyError: If two coroutines run :meth:`get`,
+                :meth:`get_iter`, or :meth:`get_reader` concurrently.
+
+        """
+        if self.get_in_progress:
+            raise ConcurrencyError(
+                "get(), get_iter(), or get_reader() is already running"
+            )
+        self.get_in_progress = True
+
+        # Locking with get_in_progress prevents concurrent execution
+        # until the reader fetches the complete message or discards it.
+
+        # Fetch the first frame.
+        try:
+            frame = await self.frames.get(not self.closed)
+        except (asyncio.CancelledError, EOFError):
+            self.get_in_progress = False
+            raise
+        self.maybe_resume()
+        assert frame.opcode is TEXT or frame.opcode is BINARY
+        return MessageReader(self, frame, decode)
+
     def put(self, frame: Frame) -> None:
         """
         Add ``frame`` to the next message.
@@ -314,3 +358,136 @@ class Assembler:
 
         # Unblock get() or get_iter().
         self.frames.abort()
+
+
+class MessageReader:
+    """
+    Read a message chunk by chunk.
+
+    :class:`MessageReader` is returned by :meth:`Assembler.get_reader`. It
+    shouldn't be instantiated directly. See that method for the constraints
+    on concurrent calls.
+
+    """
+
+    def __init__(
+        self,
+        assembler: Assembler,
+        frame: Frame,
+        decode: bool | None,
+    ) -> None:
+        self.assembler = assembler
+
+        if decode is None:
+            decode = frame.opcode is TEXT
+        self.decode = decode
+        self.decoder = UTF8Decoder() if decode else None
+
+        # Whether the final frame of the message was fetched from the queue.
+        self.fin = frame.fin
+
+        # Buffer of data fetched from the queue but not returned by read()
+        # yet. It's a str when decode is True and bytes otherwise.
+        self.buffer: Data = self.decode_frame(frame)
+
+        # Whether the reader released the assembler's lock. This happens when
+        # the message is fully consumed by read() or dropped by discard().
+        self.done = False
+
+    def decode_frame(self, frame: Frame) -> Data:
+        """Decode a frame, updating the state of the UTF-8 decoder."""
+        # Convert to bytes when frame.data is a bytearray.
+        data = bytes(frame.data)
+        if self.decoder is not None:
+            return self.decoder.decode(data, frame.fin)
+        else:
+            return data
+
+    async def fetch_frame(self) -> Frame:
+        """Fetch the next frame of the message from the queue."""
+        frame = await self.assembler.frames.get(not self.assembler.closed)
+        self.assembler.maybe_resume()
+        assert frame.opcode is CONT
+        self.fin = frame.fin
+        return frame
+
+    def extend_buffer(self, data: Data) -> None:
+        """Append decoded data to the buffer."""
+        if isinstance(self.buffer, str):
+            assert isinstance(data, str)
+            self.buffer += data
+        else:
+            assert isinstance(data, bytes)
+            self.buffer += data
+
+    async def read(self, n: int = -1) -> Data:
+        """
+        Read up to ``n`` characters or bytes of the message.
+
+        Return a :class:`str` for text messages and a :class:`bytes` for
+        binary messages, unless this behavior is overridden with the
+        ``decode`` argument of :meth:`Assembler.get_reader`.
+
+        When fewer than ``n`` characters or bytes remain in the message,
+        return them. At the end of the message, return an empty string or
+        bytestring.
+
+        Set ``n`` to a negative value to read until the end of the message.
+
+        Canceling :meth:`read` is safe. Data received before the cancellation
+        remains available to the next call to :meth:`read` or
+        :meth:`discard`.
+
+        Raises:
+            EOFError: If the stream of frames has ended.
+            UnicodeDecodeError: If a text frame contains invalid UTF-8.
+
+        """
+        if self.done:
+            return "" if self.decode else b""
+
+        if n < 0:
+            # Read until the end of the message.
+            while not self.fin:
+                self.extend_buffer(self.decode_frame(await self.fetch_frame()))
+            result, self.buffer = self.buffer, self.buffer[:0]
+        else:
+            while not self.fin and len(self.buffer) < n:
+                self.extend_buffer(self.decode_frame(await self.fetch_frame()))
+            result, self.buffer = self.buffer[:n], self.buffer[n:]
+
+        if self.fin and not self.buffer:
+            # The message is fully consumed; release the lock.
+            self.done = True
+            self.assembler.get_in_progress = False
+
+        return result
+
+    async def discard(self) -> None:
+        """
+        Discard the rest of the message.
+
+        Frames are still parsed and decoded in order to keep the connection
+        synchronized: control frames are processed, protocol errors are
+        reported, and text is checked for UTF-8 validity. Only the message
+        content isn't returned to the caller.
+
+        Canceling :meth:`discard` is safe. It may be called again to finish
+        discarding the message.
+
+        Raises:
+            EOFError: If the stream of frames has ended.
+            UnicodeDecodeError: If a text frame contains invalid UTF-8.
+
+        """
+        if self.done:
+            return
+
+        while not self.fin:
+            # Decode data to validate UTF-8 and maintain the decoder state,
+            # then drop it instead of buffering it for the caller.
+            self.decode_frame(await self.fetch_frame())
+
+        self.buffer = self.buffer[:0]
+        self.done = True
+        self.assembler.get_in_progress = False

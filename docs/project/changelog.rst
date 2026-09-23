@@ -35,6 +35,10 @@ notice.
 New features
 ............
 
+* Added :meth:`~asyncio.connection.Connection.recv_reader` to read a
+  message chunk by chunk or discard it without buffering it in the
+  :mod:`asyncio` implementation.
+
 * Added :meth:`~sync.connection.Connection.wait_closed` to the :mod:`threading`
   implementation.
 

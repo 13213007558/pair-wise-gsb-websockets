@@ -57,6 +57,8 @@ Using a connection
 
     .. automethod:: recv_streaming
 
+    .. automethod:: recv_reader
+
     .. automethod:: send
 
     .. automethod:: close

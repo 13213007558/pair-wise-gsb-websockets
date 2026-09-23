@@ -13,6 +13,8 @@ Both sides (:mod:`asyncio`)
 
     .. automethod:: recv_streaming
 
+    .. automethod:: recv_reader
+
     .. automethod:: send
 
     .. automethod:: close
@@ -52,3 +54,9 @@ Both sides (:mod:`asyncio`)
     .. autoproperty:: close_code
 
     .. autoproperty:: close_reason
+
+.. autoclass:: MessageReader
+
+    .. automethod:: read
+
+    .. automethod:: discard

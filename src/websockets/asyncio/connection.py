@@ -23,7 +23,7 @@ from ..frames import DATA_OPCODES, PONG, CloseCode, Frame
 from ..http11 import Request, Response
 from ..protocol import CLOSED, OPEN, Event, Protocol, State
 from ..typing import BytesLike, Data, DataLike, LoggerLike, Subprotocol
-from .messages import Assembler
+from .messages import Assembler, MessageReader as AssemblerMessageReader
 
 
 __all__ = ["Connection"]
@@ -388,6 +388,64 @@ class Connection(asyncio.Protocol):
                     f"{exc.reason} at position {exc.start}",
                 )
             # fallthrough
+
+        # Wait for the protocol state to be CLOSED before accessing close_exc.
+        await asyncio.shield(self.connection_lost_waiter)
+        raise self.protocol.close_exc from self.recv_exc
+
+    async def recv_reader(self, decode: bool | None = None) -> MessageReader:
+        """
+        Receive the next message as an incremental reader.
+
+        This method is designed for receiving messages when the first bytes
+        determine whether the message is wanted. It returns a
+        :class:`MessageReader`. Call its :meth:`MessageReader.read` method
+        to read the message chunk by chunk or its
+        :meth:`MessageReader.discard` method to skip the rest of the message
+        without buffering it.
+
+        The message must be fully read or discarded before calling
+        :meth:`recv`, :meth:`recv_streaming`, or :meth:`recv_reader` again.
+        Else, :exc:`~websockets.exceptions.ConcurrencyError` is raised.
+
+        :meth:`recv_reader` raises the same exceptions as :meth:`recv`.
+
+        Canceling :meth:`recv_reader` is safe. There's no risk of losing
+        data. The next invocation of :meth:`recv_reader` will return a
+        reader for the same message.
+
+        Args:
+            decode: Set this flag to override the default behavior of reading
+                :class:`str` or :class:`bytes`. See :meth:`recv` for details.
+
+        Returns:
+            A :class:`MessageReader` for the next message.
+
+        Raises:
+            ConnectionClosed: When the connection is closed.
+            ConcurrencyError: If two coroutines call :meth:`recv`,
+                :meth:`recv_streaming`, or :meth:`recv_reader` concurrently.
+
+        """
+        try:
+            reader = await self.recv_messages.get_reader(decode)
+        except EOFError:
+            pass
+            # fallthrough
+        except ConcurrencyError:
+            raise ConcurrencyError(
+                "cannot call recv_reader while another coroutine "
+                "is already running recv, recv_streaming, or recv_reader"
+            ) from None
+        except UnicodeDecodeError as exc:
+            async with self.send_context():
+                self.protocol.fail(
+                    CloseCode.INVALID_DATA,
+                    f"{exc.reason} at position {exc.start}",
+                )
+            # fallthrough
+        else:
+            return MessageReader(self, reader)
 
         # Wait for the protocol state to be CLOSED before accessing close_exc.
         await asyncio.shield(self.connection_lost_waiter)
@@ -1133,6 +1191,92 @@ class Connection(asyncio.Protocol):
         # As a consequence, they never need to write after receiving EOF, so
         # there's no reason to keep the transport open by returning True.
         # Besides, that doesn't work on TLS connections.
+
+
+class MessageReader:
+    """
+    Reader for receiving a WebSocket message chunk by chunk.
+
+    :class:`MessageReader` is returned by
+    :meth:`Connection.recv_reader`. It shouldn't be instantiated directly.
+
+    """
+
+    def __init__(self, connection: Connection, reader: AssemblerMessageReader) -> None:
+        self.connection = connection
+        self.reader = reader
+
+    async def read(self, n: int = -1) -> Data:
+        """
+        Read up to ``n`` characters or bytes of the message.
+
+        Return a :class:`str` for text messages and a :class:`bytes` for
+        binary messages, unless this behavior is overridden with the
+        ``decode`` argument of :meth:`Connection.recv_reader`.
+
+        When fewer than ``n`` characters or bytes remain in the message,
+        return them. At the end of the message, return an empty string or
+        bytestring.
+
+        Set ``n`` to a negative value to read until the end of the message.
+
+        Canceling :meth:`read` is safe. Data received before the
+        cancellation remains available to the next call to :meth:`read` or
+        :meth:`discard`.
+
+        Raises:
+            ConnectionClosed: When the connection is closed.
+
+        """
+        try:
+            return await self.reader.read(n)
+        except EOFError:
+            pass
+            # fallthrough
+        except UnicodeDecodeError as exc:
+            async with self.connection.send_context():
+                self.connection.protocol.fail(
+                    CloseCode.INVALID_DATA,
+                    f"{exc.reason} at position {exc.start}",
+                )
+            # fallthrough
+
+        # Wait for the protocol state to be CLOSED before accessing close_exc.
+        await asyncio.shield(self.connection.connection_lost_waiter)
+        raise self.connection.protocol.close_exc from self.connection.recv_exc
+
+    async def discard(self) -> None:
+        """
+        Discard the rest of the message.
+
+        Frames are still parsed and decoded in order to keep the connection
+        synchronized: pings are answered, protocol errors are reported, and
+        text is checked for UTF-8 validity. Only the message content isn't
+        returned to the caller.
+
+        Canceling :meth:`discard` is safe. It may be called again to finish
+        discarding the message.
+
+        Raises:
+            ConnectionClosed: When the connection is closed.
+
+        """
+        try:
+            return await self.reader.discard()
+        except EOFError:
+            pass
+            # fallthrough
+        except UnicodeDecodeError as exc:
+            async with self.connection.send_context():
+                self.connection.protocol.fail(
+                    CloseCode.INVALID_DATA,
+                    f"{exc.reason} at position {exc.start}",
+                )
+            # fallthrough
+
+        # Wait for the protocol state to be CLOSED before accessing close_exc.
+        await asyncio.shield(self.connection.connection_lost_waiter)
+        raise self.connection.protocol.close_exc from self.connection.recv_exc
 
 
 # broadcast() is defined in the connection module even though it's primarily
