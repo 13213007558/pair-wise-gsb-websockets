@@ -62,6 +62,18 @@ application servers.
    sansio/server
    sansio/client
 
+:mod:`http2`
+--------------
+
+This layer provides WebSocket over HTTP/2 (:rfc:`8441`) on top of h2_.
+
+.. _h2: https://python-hyper.org/projects/h2/
+
+.. toctree::
+   :titlesonly:
+
+   http2
+
 Legacy
 ------
 

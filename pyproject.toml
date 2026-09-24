@@ -26,6 +26,9 @@ classifiers = [
 ]
 dynamic = ["version", "readme"]
 
+[project.optional-dependencies]
+http2 = ["h2>=4.0"]
+
 [project.urls]
 Homepage = "https://github.com/python-websockets/websockets"
 Changelog = "https://websockets.readthedocs.io/en/stable/project/changelog.html"
