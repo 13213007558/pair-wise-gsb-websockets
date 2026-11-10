@@ -402,6 +402,7 @@ async def serve(
     close_timeout: float | None = 10,
     # Limits
     max_size: int | None | tuple[int | None, int | None] = 2**20,
+    strict_text: bool = False,
     max_queue: int | None | tuple[int | None, int | None] = 16,
     # Logging
     logger: LoggerLike | None = None,
@@ -512,6 +513,10 @@ async def serve(
             :obj:`None` disables the limit. You may pass a ``(max_message_size,
             max_fragment_size)`` tuple to set different limits for messages and
             fragments when you expect long messages sent in short fragments.
+        strict_text: Strictly validate the UTF-8 encoding of Text frames,
+            including when reading them as bytes with ``decode=False``. Binary
+            frames are not affected. Invalid, overlong, or truncated UTF-8
+            sequences close the connection with code 1007.
         max_queue: High-water mark of the buffer where frames are received.
             It defaults to 16 frames. The low-water mark defaults to ``max_queue
             // 4``. You may pass a ``(high, low)`` tuple to set the high-water
@@ -616,6 +621,7 @@ async def serve(
                         subprotocols=subprotocols,
                         select_subprotocol=protocol_select_subprotocol,
                         max_size=max_size,
+                        strict_text=strict_text,
                         logger=logger,
                     )
 

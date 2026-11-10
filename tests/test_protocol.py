@@ -93,6 +93,28 @@ class ProtocolTestCase(FramesTestCase):
         # A close frame and possibly the end of stream were sent.
         self.assertFrameSent(connection, close_frame, eof=connection.side is SERVER)
 
+    def assertConnectionFailingWithCode(self, connection, code):
+        """
+        Incoming data failed the connection with a close frame carrying ``code``.
+
+        Unlike assertConnectionFailing, this ignores the close reason and any
+        frame that was appended to the event queue before the failure surfaced.
+
+        """
+        writes = [
+            write
+            for write in connection.data_to_send()
+            if write is not SEND_EOF
+        ]
+        (write,) = writes
+        close_frame = self.parse(
+            write,
+            mask=connection.side is CLIENT,
+            extensions=connection.extensions,
+        )
+        self.assertEqual(close_frame.opcode, CLOSE)
+        self.assertEqual(Close.parse(close_frame.data).code, code)
+
 
 class MaskingTests(ProtocolTestCase):
     """
@@ -531,6 +553,125 @@ class TextTests(ProtocolTestCase):
         server.receive_data(b"\x81\x80\x00\xff\x00\xff")
         self.assertFrameReceived(server, None)
         self.assertFrameSent(server, None)
+
+
+class StrictTextTests(ProtocolTestCase):
+    # A few short messages; each one is split at every possible byte position.
+    # Valid messages contain a multibyte character crossing the split; invalid
+    # ones append an illegal, overlong, or truncated suffix.
+    valid_messages = [
+        b"ab",
+        "😀".encode(),
+        "a😀".encode(),
+        "😀b".encode(),
+        "éé".encode(),
+    ]
+    invalid_messages = [
+        b"a\xff",
+        b"ab\xfe",
+        b"\xc0\xaf",  # overlong encoding of "/"
+        b"\xe0\x80\x80",  # overlong encoding of NUL
+        b"\xed\xa0\x80",  # UTF-16 surrogate
+        "😀".encode()[:3],  # truncated multibyte sequence
+        b"a" + "😀".encode()[:2],  # truncated sequence after valid text
+    ]
+
+    def split_frames(self, data, split):
+        """Build an unfragmented frame or two fragments split at ``split``."""
+        if split == len(data):
+            return [b"\x81" + bytes([len(data)]) + data]
+        first, second = data[:split], data[split:]
+        return [
+            b"\x01" + bytes([len(first)]) + first,
+            b"\x80" + bytes([len(second)]) + second,
+        ]
+
+    def test_strict_text_disabled_by_default(self):
+        client = Protocol(CLIENT)
+        self.assertFalse(client.strict_text)
+
+    def test_strict_text_accepts_valid_text_at_every_split(self):
+        for message in self.valid_messages:
+            for split in range(1, len(message) + 1):
+                client = Protocol(CLIENT, strict_text=True)
+                for frame in self.split_frames(message, split):
+                    client.receive_data(frame)
+                self.assertIsNone(client.parser_exc, (message, split))
+                self.assertEqual(
+                    b"".join(
+                        bytes(frame.data) for frame in client.events_received()
+                    ),
+                    message,
+                )
+
+    def test_strict_text_rejects_invalid_text_at_every_split(self):
+        for message in self.invalid_messages:
+            for split in range(1, len(message) + 1):
+                client = Protocol(CLIENT, strict_text=True)
+                for frame in self.split_frames(message, split):
+                    client.receive_data(frame)
+                self.assertIsInstance(
+                    client.parser_exc, UnicodeDecodeError, (message, split)
+                )
+                self.assertConnectionFailingWithCode(
+                    client, CloseCode.INVALID_DATA
+                )
+
+    def test_strict_text_does_not_change_frame_payload(self):
+        # Validation is independent of the return type: the raw bytes of a
+        # valid payload are delivered unchanged.
+        client = Protocol(CLIENT, strict_text=True)
+        client.receive_data(b"\x81\x04\xf0\x9f\x98\x80")
+        self.assertFrameReceived(client, Frame(TEXT, "😀".encode()))
+
+    def test_strict_text_ignores_binary_frames(self):
+        for message in self.invalid_messages:
+            client = Protocol(CLIENT, strict_text=True)
+            client.receive_data(b"\x82" + bytes([len(message)]) + message)
+            self.assertIsNone(client.parser_exc, message)
+            self.assertFrameReceived(client, Frame(BINARY, message))
+
+    def test_strict_text_keeps_state_across_interleaved_control_frame(self):
+        client = Protocol(CLIENT, strict_text=True)
+        # Start a text message with the first half of a multibyte character.
+        client.receive_data(b"\x01\x02\xf0\x9f")
+        self.assertFrameReceived(
+            client,
+            Frame(TEXT, "😀".encode()[:2], fin=False),
+        )
+        # A control frame must not reset the text validation state.
+        client.receive_data(b"\x89\x00")
+        self.assertFrameReceived(client, Frame(PING, b""))
+        client.receive_data(b"\x80\x02\x98\x80")
+        self.assertIsNone(client.parser_exc)
+        self.assertFrameReceived(client, Frame(CONT, "😀".encode()[2:]))
+
+    def test_strict_text_resets_state_between_messages(self):
+        client = Protocol(CLIENT, strict_text=True)
+        client.receive_data(b"\x81\x01\x61")
+        self.assertFrameReceived(client, Frame(TEXT, b"a"))
+        # A truncated sequence in the next message must still be detected.
+        client.receive_data(b"\x81\x03\xf0\x9f\x98")
+        self.assertIsInstance(client.parser_exc, UnicodeDecodeError)
+        self.assertConnectionFailingWithCode(client, CloseCode.INVALID_DATA)
+
+    def test_lenient_text_accepts_invalid_payload_unchanged(self):
+        # Default behavior preserves backwards compatibility: invalid bytes are
+        # passed through without failing the connection.
+        for message in self.invalid_messages:
+            client = Protocol(CLIENT)
+            client.receive_data(b"\x81" + bytes([len(message)]) + message)
+            self.assertIsNone(client.parser_exc, message)
+            self.assertFrameReceived(client, Frame(TEXT, message))
+
+    def test_server_enforces_strict_text(self):
+        # Masking doesn't affect validation; run the same checks server-side.
+        server = Protocol(SERVER, strict_text=True)
+        server.receive_data(b"\x81\x82\x00\x00\x00\x00\x61\xff")
+        self.assertIsInstance(server.parser_exc, UnicodeDecodeError)
+        self.assertConnectionFailingWithCode(
+            server, CloseCode.INVALID_DATA
+        )
 
 
 class BinaryTests(ProtocolTestCase):

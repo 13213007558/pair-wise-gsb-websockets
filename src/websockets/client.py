@@ -65,6 +65,8 @@ class ClientProtocol(Protocol):
             :obj:`None` disables the limit. You may pass a ``(max_message_size,
             max_fragment_size)`` tuple to set different limits for messages and
             fragments when you expect long messages sent in short fragments.
+        strict_text: Strictly validate the UTF-8 encoding of the payload of
+            Text frames, including when the application reads them as bytes.
         logger: Logger for this connection;
             defaults to ``logging.getLogger("websockets.client")``;
             see the :doc:`logging guide <../../topics/logging>` for details.
@@ -80,12 +82,14 @@ class ClientProtocol(Protocol):
         subprotocols: Sequence[Subprotocol] | None = None,
         state: State = CONNECTING,
         max_size: int | None | tuple[int | None, int | None] = 2**20,
+        strict_text: bool = False,
         logger: LoggerLike | None = None,
     ) -> None:
         super().__init__(
             side=CLIENT,
             state=state,
             max_size=max_size,
+            strict_text=strict_text,
             logger=logger,
         )
         self.uri = uri

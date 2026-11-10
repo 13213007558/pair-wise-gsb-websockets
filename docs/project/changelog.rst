@@ -32,6 +32,13 @@ notice.
 
 *In development*
 
+* Added a ``strict_text`` parameter to enforce the UTF-8 encoding rules of
+  :rfc:`6455` for Text frames independently of the ``decode`` argument used when
+  reading messages. When enabled, Text frames are validated even if the
+  application reads them as bytes with ``decode=False``; Binary frames are not
+  affected. Invalid, overlong, or truncated UTF-8 sequences, including ones
+  split across continuation frames, fail the connection with code 1007.
+
 .. _17.4:
 
 17.4

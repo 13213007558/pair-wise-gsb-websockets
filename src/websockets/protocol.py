@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import enum
 import logging
 import uuid
@@ -41,6 +42,8 @@ __all__ = [
 Event = Request | Response | Frame
 """Events that :meth:`~Protocol.events_received` may return."""
 
+UTF8Decoder = codecs.getincrementaldecoder("utf-8")
+
 
 class Side(enum.IntEnum):
     """A WebSocket connection is either a server or a client."""
@@ -79,6 +82,13 @@ class Protocol:
             :obj:`None` disables the limit. You may pass a ``(max_message_size,
             max_fragment_size)`` tuple to set different limits for messages and
             fragments when you expect long messages sent in short fragments.
+        strict_text: Strictly validate the UTF-8 encoding of the payload of
+            Text frames, including when the application reads them as bytes.
+            This enforces the rule of :rfc:`6455` that Text frames must contain
+            UTF-8 text, independently of the ``decode`` argument used when
+            reading messages. Invalid, overlong, or truncated sequences fail
+            the connection with :attr:`~CloseCode.INVALID_DATA`. Binary frames
+            are not affected.
         logger: Logger for this connection; depending on ``side``,
             defaults to ``logging.getLogger("websockets.client")``
             or ``logging.getLogger("websockets.server")``;
@@ -92,6 +102,7 @@ class Protocol:
         *,
         state: State = OPEN,
         max_size: tuple[int | None, int | None] | int | None = 2**20,
+        strict_text: bool = False,
         logger: LoggerLike | None = None,
     ) -> None:
         # Unique identifier. For logs.
@@ -118,6 +129,14 @@ class Protocol:
             self.max_message_size, self.max_fragment_size = max_size, None
         else:
             self.max_message_size, self.max_fragment_size = max_size
+
+        # Strictly validate UTF-8 in the payload of Text frames.
+        self.strict_text = strict_text
+
+        # Incremental UTF-8 decoder for the text message being received.
+        # It carries state across continuation frames; control frames don't
+        # interrupt a fragmented message and thus don't reset this state.
+        self.text_decoder: codecs.IncrementalDecoder | None = None
 
         # Current size of incoming message in bytes. Only set while reading a
         # fragmented message i.e. a data frames with the FIN bit not set.
@@ -680,6 +699,15 @@ class Protocol:
                 raise ProtocolError("expected a continuation frame")
             if not frame.fin:
                 self.current_size = len(frame.data)
+            if self.strict_text and frame.opcode is TEXT:
+                # Start validating a new text message. The decoder carries the
+                # state of an incomplete multibyte sequence to the next frame.
+                self.text_decoder = UTF8Decoder()
+                self.text_decoder.decode(frame.data, frame.fin)
+                if frame.fin:
+                    # Finalize the message: a truncated multibyte sequence at
+                    # the end raises UnicodeDecodeError here.
+                    self.text_decoder = None
 
         elif frame.opcode is CONT:
             if self.current_size is None:
@@ -688,6 +716,15 @@ class Protocol:
                 self.current_size = None
             else:
                 self.current_size += len(frame.data)
+            if self.text_decoder is not None:
+                # Continue validating the text message across fragments.
+                # Interleaved control frames don't reach this branch, so the
+                # decoder state survives them unchanged.
+                self.text_decoder.decode(frame.data, frame.fin)
+                if frame.fin:
+                    # Finalize the message: a truncated multibyte sequence at
+                    # the end raises UnicodeDecodeError here.
+                    self.text_decoder = None
 
         elif frame.opcode is PING:
             # 5.5.2. Ping: "Upon receipt of a Ping frame, an endpoint MUST

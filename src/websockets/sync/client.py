@@ -230,6 +230,7 @@ class reconnect:
         reconnect_delays: Callable[[], Generator[float]] = backoff,
         # Limits
         max_size: int | None | tuple[int | None, int | None] = 2**20,
+        strict_text: bool = False,
         max_queue: int | None | tuple[int | None, int | None] = 16,
         # Logging
         logger: LoggerLike | None = None,
@@ -284,6 +285,7 @@ class reconnect:
             extensions=extensions,
             subprotocols=subprotocols,
             max_size=max_size,
+            strict_text=strict_text,
             logger=logger,
         )
         self.connection_kwargs = dict(
@@ -602,6 +604,7 @@ def connect(
     close_timeout: float | None = ...,
     # Limits
     max_size: int | None | tuple[int | None, int | None] = ...,
+    strict_text: bool = ...,
     max_queue: int | None | tuple[int | None, int | None] = ...,
     # Logging
     logger: LoggerLike | None = ...,
@@ -640,6 +643,7 @@ def connect(
     close_timeout: float | None = ...,
     # Limits
     max_size: int | None | tuple[int | None, int | None] = ...,
+    strict_text: bool = ...,
     max_queue: int | None | tuple[int | None, int | None] = ...,
     # Logging
     logger: LoggerLike | None = ...,
@@ -677,6 +681,7 @@ def connect(
     close_timeout: float | None = 10,
     # Limits
     max_size: int | None | tuple[int | None, int | None] = 2**20,
+    strict_text: bool = False,
     max_queue: int | None | tuple[int | None, int | None] = 16,
     # Logging
     logger: LoggerLike | None = None,
@@ -757,6 +762,10 @@ def connect(
             :obj:`None` disables the limit. You may pass a ``(max_message_size,
             max_fragment_size)`` tuple to set different limits for messages and
             fragments when you expect long messages sent in short fragments.
+        strict_text: Strictly validate the UTF-8 encoding of Text frames,
+            including when reading them as bytes with ``decode=False``. Binary
+            frames are not affected. Invalid, overlong, or truncated UTF-8
+            sequences close the connection with code 1007.
         max_queue: High-water mark of the buffer where frames are received.
             It defaults to 16 frames. The low-water mark defaults to ``max_queue
             // 4``. You may pass a ``(high, low)`` tuple to set the high-water
@@ -804,6 +813,7 @@ def connect(
         ping_timeout=ping_timeout,
         close_timeout=close_timeout,
         max_size=max_size,
+        strict_text=strict_text,
         max_queue=max_queue,
         logger=logger,
         create_connection=create_connection,

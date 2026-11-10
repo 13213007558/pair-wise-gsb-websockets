@@ -18,7 +18,17 @@ from websockets.exceptions import (
     PayloadTooBig,
     TooManyFragments,
 )
-from websockets.frames import BINARY, CLOSE, CONT, PING, PONG, TEXT, CloseCode, Frame
+from websockets.frames import (
+    BINARY,
+    CLOSE,
+    CONT,
+    PING,
+    PONG,
+    TEXT,
+    Close,
+    CloseCode,
+    Frame,
+)
 from websockets.protocol import CLIENT, CLOSED, OPEN, SERVER, Protocol
 
 from ..protocol import RecordingProtocol
@@ -1548,6 +1558,118 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
 
 
 class ServerConnectionTests(ClientConnectionTests):
+    LOCAL = SERVER
+    REMOTE = CLIENT
+
+
+class StrictTextConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
+    """
+    Integration tests for strict validation of Text frames.
+
+    These tests check both the fragments delivered to the application and the
+    close code sent on the wire when validation fails.
+
+    """
+
+    LOCAL = CLIENT
+    REMOTE = SERVER
+
+    async def asyncSetUp(self):
+        self.loop = asyncio.get_running_loop()
+        socket_, remote_socket = socket.socketpair()
+        protocol = Protocol(self.LOCAL, strict_text=True)
+        remote_protocol = RecordingProtocol(self.REMOTE)
+        self.transport, self.connection = await self.loop.create_connection(
+            lambda: Connection(protocol, close_timeout=2 * MS),
+            sock=socket_,
+        )
+        _remote_transport, self.remote_connection = await self.loop.create_connection(
+            lambda: InterceptingConnection(remote_protocol),
+            sock=remote_socket,
+        )
+
+    async def asyncTearDown(self):
+        await self.remote_connection.close()
+        if hasattr(self, "connection"):
+            await self.connection.close()
+
+    async def wait_for_remote_side(self):
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    async def assertClosedWithInvalidData(self):
+        """The connection fails with 1007 and the close frame reaches the peer."""
+        await self.wait_for_remote_side()
+        frames = self.remote_connection.protocol.get_frames_rcvd()
+        self.assertEqual([frame.opcode for frame in frames], [CLOSE])
+        self.assertEqual(Close.parse(frames[0].data).code, CloseCode.INVALID_DATA)
+
+    async def send_frames(self, frames):
+        """Serialize frames through the remote protocol onto the wire."""
+        for frame in frames:
+            self.remote_connection.protocol.send_frame(frame)
+        self.remote_connection.send_data()
+        await self.wait_for_remote_side()
+
+    async def test_strict_text_accepts_valid_text_as_bytes(self):
+        """recv(decode=False) still validates and returns unchanged bytes."""
+        await self.remote_connection.send("😀")
+        self.assertEqual(
+            await self.connection.recv(decode=False),
+            "😀".encode(),
+        )
+
+    async def test_strict_text_rejects_invalid_text_as_bytes(self):
+        """recv(decode=False) fails the connection on invalid UTF-8."""
+        await self.remote_connection.send(b"a\xff", text=True)
+        with self.assertRaises(ConnectionClosedError) as raised:
+            await self.connection.recv(decode=False)
+        self.assertEqual(raised.exception.sent.code, CloseCode.INVALID_DATA)
+        self.assertIsInstance(raised.exception.__cause__, UnicodeDecodeError)
+        await self.assertClosedWithInvalidData()
+
+    async def test_strict_text_accepts_invalid_binary_as_bytes(self):
+        """Binary frames are not subject to text validation."""
+        await self.remote_connection.send(b"a\xff")
+        self.assertEqual(await self.connection.recv(decode=False), b"a\xff")
+
+    async def test_strict_text_streaming_delivers_prefix_then_fails(self):
+        """Streaming yields a valid prefix before failing on a later fragment.
+
+        The already delivered prefix cannot be taken back, so the iterator does
+        not claim the whole message was validated up front.
+
+        """
+        # First fragment is valid; second fragment contains an illegal byte.
+        await self.send_frames(
+            [
+                Frame(TEXT, b"ab", fin=False),
+                Frame(CONT, b"\xff", fin=True),
+            ]
+        )
+        iterator = self.connection.recv_streaming(decode=False)
+        self.assertEqual(await anext(iterator), b"ab")
+        with self.assertRaises(ConnectionClosedError) as raised:
+            await anext(iterator)
+        self.assertEqual(raised.exception.sent.code, CloseCode.INVALID_DATA)
+        await self.assertClosedWithInvalidData()
+
+    async def test_strict_text_streaming_valid_cross_fragment_character(self):
+        """A multibyte character split across fragments is accepted."""
+        emoji = "😀".encode()
+        await self.send_frames(
+            [
+                Frame(TEXT, emoji[:2], fin=False),
+                Frame(CONT, emoji[2:], fin=True),
+            ]
+        )
+        self.assertEqual(
+            await alist(self.connection.recv_streaming(decode=False)),
+            [emoji[:2], emoji[2:]],
+        )
+
+
+class StrictTextServerConnectionTests(StrictTextConnectionTests):
     LOCAL = SERVER
     REMOTE = CLIENT
 

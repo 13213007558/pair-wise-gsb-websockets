@@ -195,6 +195,15 @@ You can also force UTF-8 decoding of binary messages with ``decode=True``. This
 is rarely useful and has no performance benefits over decoding a :class:`bytes`
 object returned by :meth:`~asyncio.connection.Connection.recv`.
 
+By default, reading a Text frame as bytes with ``decode=False`` skips UTF-8
+decoding, so an invalid payload is returned instead of closing the connection.
+Set the ``strict_text`` parameter of :func:`~asyncio.client.connect` or
+:func:`~asyncio.server.serve` to enforce the UTF-8 rules of :rfc:`6455`
+regardless of the ``decode`` argument. Then invalid, overlong, or truncated
+sequences—including a multibyte character split across continuation
+frames—fail the connection with code 1007, while the returned bytes remain
+unchanged. Binary frames are never affected.
+
 Receiving fragmented messages
 .............................
 
