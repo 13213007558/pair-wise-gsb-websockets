@@ -16,6 +16,7 @@ from websockets.exceptions import (
     PayloadTooBig,
     TooManyFragments,
 )
+from websockets.extensions.permessage_deflate import PerMessageDeflate
 from websockets.frames import BINARY, CLOSE, CONT, PING, PONG, TEXT, CloseCode, Frame
 from websockets.protocol import CLIENT, CLOSED, OPEN, SERVER, Protocol
 from websockets.trio.connection import *
@@ -569,6 +570,89 @@ class ClientConnectionTests(LoggingTestCase, IsolatedTrioTestCase):
         self.assertEqual(
             await alist(self.remote_connection.recv_streaming()),
             ["😀", "😀", ""],
+        )
+
+    # Test per-message compression.
+
+    async def make_compressed_connection(self):
+        """Build a connection pair negotiating permessage-deflate."""
+        stream, remote_stream = trio.testing.memory_stream_pair()
+        protocol = Protocol(self.LOCAL)
+        remote_protocol = RecordingProtocol(self.REMOTE)
+        # Separate extension instances so each side has its own context.
+        protocol.extensions = [PerMessageDeflate(False, False, 15, 15)]
+        remote_protocol.extensions = [PerMessageDeflate(False, False, 15, 15)]
+        connection = Connection(self.nursery, stream, protocol, close_timeout=2 * MS)
+        remote_connection = InterceptingConnection(
+            self.nursery,
+            remote_stream,
+            remote_protocol,
+        )
+        return connection, remote_connection
+
+    def assertRsv1Bits(self, connection, expected):
+        """Check the RSV1 bit of every frame currently buffered for sending."""
+        rsv1_bits = [
+            bool(write[0] & 0x40) for write in connection.protocol.data_to_send()
+        ]
+        self.assertEqual(rsv1_bits, expected)
+
+    async def test_send_uncompressed_message(self):
+        """send with compress=False produces an RSV1=0 frame and decodes."""
+        connection, remote = await self.make_compressed_connection()
+        await connection.send(b"credential=SECRET", compress=False)
+        self.assertEqual(await remote.recv(), b"credential=SECRET")
+        self.assertEqual(
+            remote.protocol.get_frames_rcvd(),
+            [Frame(BINARY, b"credential=SECRET")],
+        )
+
+    async def test_send_normal_sensitive_normal_sequence(self):
+        """A real receiver decodes compressed, uncompressed, compressed."""
+        connection, remote = await self.make_compressed_connection()
+        await connection.send(b"ordinary event one")
+        await connection.send(b"credential=SECRET", compress=False)
+        await connection.send(b"ordinary event two")
+        # The remote endpoint decodes the whole sequence correctly, including
+        # with context takeover enabled across the skipped message.
+        self.assertEqual(await remote.recv(), b"ordinary event one")
+        self.assertEqual(await remote.recv(), b"credential=SECRET")
+        self.assertEqual(await remote.recv(), b"ordinary event two")
+
+    async def test_send_compressed_and_uncompressed_rsv1_bytes(self):
+        """Only the compress=False message serializes with RSV1 cleared."""
+        connection, remote = await self.make_compressed_connection()
+        # Unfragmented uncompressed message: inspect the serialized bytes.
+        connection.protocol.send_text(b"credential=SECRET", compress=False)
+        self.assertRsv1Bits(connection, [False])
+        connection.protocol.data_to_send()  # discard writes
+        # Default behavior remains compression, i.e. RSV1 set.
+        connection.protocol.send_text(b"ordinary event")
+        self.assertRsv1Bits(connection, [True])
+
+    async def test_send_uncompressed_fragmented_message(self):
+        """All fragments of a compress=False message stay uncompressed."""
+        connection, remote = await self.make_compressed_connection()
+        await connection.send([b"credential=", b"SECRET"], compress=False)
+        self.assertEqual(
+            remote.protocol.get_frames_rcvd(),
+            [
+                Frame(BINARY, b"credential=", fin=False),
+                Frame(CONT, b"SECRET", fin=False),
+                Frame(CONT, b"", fin=True),
+            ],
+        )
+        self.assertEqual(await remote.recv(), b"credential=SECRET")
+        # Compression still works afterwards and decodes correctly.
+        await connection.send(b"ordinary event")
+        self.assertEqual(await remote.recv(), b"ordinary event")
+
+    async def test_send_compress_false_without_extension(self):
+        """compress=False is a no-op when no compression extension is active."""
+        await self.connection.send(b"plain", compress=False)
+        self.assertEqual(
+            self.remote_connection.protocol.get_frames_rcvd(),
+            [Frame(BINARY, b"plain")],
         )
 
     async def test_send_connection_closed_ok(self):

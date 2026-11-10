@@ -29,6 +29,38 @@ To disable compression, set ``compression=None``::
 
     serve(..., compression=None, ...)
 
+Disabling compression for a single message
+------------------------------------------
+
+Sometimes a connection carries both ordinary events and sensitive messages,
+for example responses containing a one-time credential, on the same channel.
+While you want to keep compressing ordinary events, you may want to send a
+sensitive message without compression, so that it doesn't enter the
+compression context.
+
+When the Per-Message Deflate extension is negotiated, pass
+``compress=False`` to :meth:`~websockets.asyncio.connection.Connection.send`
+to skip compression for that message::
+
+    await websocket.send(
+        '{"credential": "one-time-secret-token"}',
+        compress=False,
+    )
+
+The threading API provides the same option::
+
+    websocket.send(
+        '{"credential": "one-time-secret-token"}',
+        compress=False,
+    )
+
+This sets the choice for the entire message: if the message is fragmented,
+every fragment is sent uncompressed. An uncompressed message doesn't update
+the compression context, so subsequent compressed messages remain
+decodable by the peer even when context takeover is enabled. If no
+compression extension was negotiated, ``compress=False`` has no effect and
+the message is sent as usual.
+
 To customize compression settings, enable the Per-Message Deflate extension
 explicitly with :class:`ClientPerMessageDeflateFactory` or
 :class:`ServerPerMessageDeflateFactory`::

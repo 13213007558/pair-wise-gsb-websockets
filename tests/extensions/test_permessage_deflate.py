@@ -313,6 +313,96 @@ class PerMessageDeflateTests(unittest.TestCase, PerMessageDeflateTestsMixin):
         with self.assertRaises(ProtocolError):
             self.extension.decode(enc_frame2)
 
+    # Compression can be skipped per message.
+
+    def test_no_encode_text_frame(self):
+        frame = Frame(TEXT, "café".encode(), compress=False)
+
+        enc_frame = self.extension.encode(frame)
+
+        # The frame is passed through unchanged: no RSV1, no compression.
+        self.assertEqual(enc_frame, frame)
+        # A peer extension decodes it as an uncompressed frame.
+        self.assertEqual(self.extension.decode(enc_frame), frame)
+
+    def test_no_encode_binary_frame(self):
+        frame = Frame(BINARY, b"tea", compress=False)
+
+        enc_frame = self.extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+        self.assertEqual(self.extension.decode(enc_frame), frame)
+
+    def test_no_encode_fragmented_frame(self):
+        frame1 = Frame(TEXT, b"tea ", fin=False, compress=False)
+        frame2 = Frame(CONT, b"time", fin=False)
+        frame3 = Frame(CONT, b" now")
+
+        enc_frame1 = self.extension.encode(frame1)
+        enc_frame2 = self.extension.encode(frame2)
+        enc_frame3 = self.extension.encode(frame3)
+
+        # Every frame of the uncompressed message is passed through unchanged.
+        self.assertEqual(enc_frame1, frame1)
+        self.assertEqual(enc_frame2, frame2)
+        self.assertEqual(enc_frame3, frame3)
+        self.assertFalse(self.extension.encode_cont_data)
+
+        dec_frame1 = self.extension.decode(enc_frame1)
+        dec_frame2 = self.extension.decode(enc_frame2)
+        dec_frame3 = self.extension.decode(enc_frame3)
+
+        self.assertEqual(dec_frame1, frame1)
+        self.assertEqual(dec_frame2, frame2)
+        self.assertEqual(dec_frame3, frame3)
+
+    def test_no_encode_does_not_poison_compression_context(self):
+        # A compressed message establishes context.
+        first = Frame(TEXT, "café café café".encode())
+        enc_first = self.extension.encode(first)
+        self.assertTrue(enc_first.rsv1)
+
+        # An uncompressed message must not feed the compression context.
+        secret = Frame(TEXT, b"SECRET-TOKEN", compress=False)
+        enc_secret = self.extension.encode(secret)
+        self.assertEqual(enc_secret, secret)
+
+        # A peer decoding the sequence can still decode the next compressed
+        # message because context takeover remains synchronized.
+        peer = PerMessageDeflate(False, False, 15, 15)
+        self.assertEqual(peer.decode(enc_first), first)
+        self.assertEqual(peer.decode(enc_secret), secret)
+
+        third = Frame(TEXT, "café café café".encode())
+        enc_third = self.extension.encode(third)
+        self.assertTrue(enc_third.rsv1)
+        self.assertEqual(peer.decode(enc_third), third)
+
+    def test_compression_resumes_after_uncompressed_fragmented_message(self):
+        # An uncompressed fragmented message leaves no continuation state.
+        frame1 = Frame(TEXT, b"tea ", fin=False, compress=False)
+        frame2 = Frame(CONT, b"time")
+        self.assertEqual(self.extension.encode(frame1), frame1)
+        self.assertEqual(self.extension.encode(frame2), frame2)
+        self.assertFalse(self.extension.encode_cont_data)
+
+        # The next, compressed message works as usual.
+        compressed = Frame(TEXT, "café".encode())
+        enc_compressed = self.extension.encode(compressed)
+        self.assertTrue(enc_compressed.rsv1)
+        self.assertEqual(self.extension.decode(enc_compressed), compressed)
+
+    def test_no_encode_local_no_context_takeover(self):
+        # With local_no_context_takeover, skipping compression must not create
+        # an encoder that would then be reused across messages.
+        extension = PerMessageDeflate(False, True, 15, 15)
+        frame = Frame(TEXT, "café".encode(), compress=False)
+
+        enc_frame = extension.encode(frame)
+
+        self.assertEqual(enc_frame, frame)
+        self.assertFalse(hasattr(extension, "encoder"))
+
 
 class ClientPerMessageDeflateFactoryTests(
     unittest.TestCase, PerMessageDeflateTestsMixin

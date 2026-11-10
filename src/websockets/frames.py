@@ -126,6 +126,9 @@ class Frame:
         rsv1: RSV1 bit.
         rsv2: RSV2 bit.
         rsv3: RSV3 bit.
+        compress: Whether extensions may compress this frame. This applies to
+            the entire message; continuation frames inherit the value from the
+            first frame.
 
     Only these fields are needed. The MASK bit, payload length and masking-key
     are handled on the fly when parsing and serializing frames.
@@ -138,6 +141,7 @@ class Frame:
     rsv1: bool = False
     rsv2: bool = False
     rsv3: bool = False
+    compress: bool = True
 
     # Configure if you want to see more in logs. Should be a multiple of 3.
     MAX_LOG_SIZE = int(os.environ.get("WEBSOCKETS_MAX_LOG_SIZE", "75"))

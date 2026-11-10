@@ -78,10 +78,12 @@ class PerMessageDeflate(Extension):
             )
 
         # To handle continuation frames properly, we must keep track of
-        # whether that initial frame was encoded.
+        # whether the initial frame of a fragmented message was encoded or
+        # decoded. Compression is chosen per message: all frames of a message
+        # share the same choice, so an uncompressed message never feeds the
+        # compression context and a compressed one always does.
         self.decode_cont_data = False
-        # There's no need for self.encode_cont_data because we always encode
-        # outgoing frames, so it would always be True.
+        self.encode_cont_data = False
 
     def __repr__(self) -> str:
         return (
@@ -176,16 +178,31 @@ class PerMessageDeflate(Extension):
         if frame.opcode in CTRL_OPCODES:
             return frame
 
-        # Since we always encode messages, there's no "encode continuation
-        # data" flag similar to "decode continuation data" at this time.
+        # Handle continuation data frames:
+        # - skip if the message isn't encoded
+        # - reset "encode continuation data" flag if it's a final frame
+        if frame.opcode is CONT:
+            if not self.encode_cont_data:
+                return frame
+            if frame.fin:
+                self.encode_cont_data = False
 
-        if frame.opcode is not CONT:
-            # Re-initialize per-message decoder.
-            if self.local_no_context_takeover:
-                self.encoder = zlib.compressobj(
-                    wbits=-self.local_max_window_bits,
-                    **self.compress_settings,
-                )
+        # Handle text and binary data frames:
+        # - skip if compression is disabled for this message
+        # - set "encode continuation data" flag if it's a non-final frame
+        elif not frame.compress:
+            # Don't feed uncompressed data into the compression context.
+            return frame
+        else:
+            if not frame.fin:
+                self.encode_cont_data = True
+
+        # Re-initialize per-message encoder.
+        if self.local_no_context_takeover and frame.opcode is not CONT:
+            self.encoder = zlib.compressobj(
+                wbits=-self.local_max_window_bits,
+                **self.compress_settings,
+            )
 
         # Compress data.
         data: BytesLike

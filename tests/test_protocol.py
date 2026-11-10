@@ -9,6 +9,7 @@ from websockets.exceptions import (
     PayloadTooBig,
     ProtocolError,
 )
+from websockets.extensions.permessage_deflate import PerMessageDeflate
 from websockets.frames import (
     BINARY,
     CLOSE,
@@ -1884,6 +1885,100 @@ class ExtensionsTests(ProtocolTestCase):
         server.extensions = [Rsv2Extension()]
         server.receive_data(b"\xaa\x80\x00\x44\x88\xcc")
         self.assertEqual(server.events_received(), [Frame(PONG, b"")])
+
+
+class PerMessageCompressionTests(ProtocolTestCase):
+    """
+    Test skipping permessage-deflate compression for individual messages.
+
+    """
+
+    def make_pair(self):
+        client = Protocol(CLIENT)
+        server = Protocol(SERVER)
+        client.extensions = [PerMessageDeflate(False, False, 15, 15)]
+        server.extensions = [PerMessageDeflate(False, False, 15, 15)]
+        return client, server
+
+    def transfer(self, sender, receiver, data, *, fin=True, compress=True):
+        sender.send_text(data, fin=fin, compress=compress)
+        writes = sender.data_to_send()
+        rsv1_bits = [bool(write[0] & 0x40) for write in writes]
+        for write in writes:
+            receiver.receive_data(write)
+        frames = receiver.events_received()
+        self.assertEqual(b"".join(bytes(frame.data) for frame in frames), data)
+        return rsv1_bits, [frame.rsv1 for frame in frames]
+
+    def test_compressed_sets_rsv1(self):
+        client, server = self.make_pair()
+        rsv1_sent, rsv1_rcvd = self.transfer(
+            client, server, b"ordinary event", compress=True
+        )
+        self.assertEqual(rsv1_sent, [True])
+        self.assertEqual(rsv1_rcvd, [False])
+
+    def test_uncompressed_clears_rsv1_and_preserves_bytes(self):
+        client, server = self.make_pair()
+        rsv1_sent, rsv1_rcvd = self.transfer(
+            client, server, b"credential=SECRET", compress=False
+        )
+        self.assertEqual(rsv1_sent, [False])
+        self.assertEqual(rsv1_rcvd, [False])
+        # The wire payload is the plain payload, not a deflate stream.
+        server.send_text(b"credential=SECRET", compress=False)
+        self.assertEqual(server.data_to_send()[0], b"\x81\x11credential=SECRET")
+
+    def test_normal_sensitive_normal_sequence(self):
+        client, server = self.make_pair()
+        self.assertEqual(
+            self.transfer(client, server, b"ordinary event one")[0], [True]
+        )
+        self.assertEqual(
+            self.transfer(client, server, b"credential=SECRET", compress=False)[0],
+            [False],
+        )
+        # Context takeover still works: the receiver decodes the next
+        # compressed message despite the uncompressed one in between.
+        self.assertEqual(
+            self.transfer(client, server, b"ordinary event two")[0], [True]
+        )
+
+    def test_uncompressed_fragmented_message(self):
+        client, server = self.make_pair()
+        client.send_text(b"creden", fin=False, compress=False)
+        client.send_continuation(b"tial=SECRET", fin=True)
+        writes = client.data_to_send()
+        # No frame of the uncompressed message sets RSV1.
+        self.assertEqual([bool(write[0] & 0x40) for write in writes], [False, False])
+        for write in writes:
+            server.receive_data(write)
+        frames = server.events_received()
+        self.assertEqual(
+            b"".join(bytes(frame.data) for frame in frames), b"credential=SECRET"
+        )
+        self.assertFalse(client.expect_continuation_frame)
+
+    def test_compressed_fragmented_then_uncompressed_message(self):
+        client, server = self.make_pair()
+        # A compressed fragmented message resets continuation state properly.
+        client.send_text(b"ordi", fin=False)
+        client.send_continuation(b"nary", fin=True)
+        for write in client.data_to_send():
+            server.receive_data(write)
+        frames = server.events_received()
+        self.assertEqual(b"".join(bytes(frame.data) for frame in frames), b"ordinary")
+        self.assertEqual(
+            self.transfer(client, server, b"SECRET", compress=False)[0], [False]
+        )
+
+    def test_compress_without_extension_is_noop(self):
+        server = Protocol(SERVER)
+        # No extension negotiated: compress=False produces an ordinary frame.
+        server.send_text(b"plain", compress=False)
+        self.assertEqual(server.data_to_send(), [b"\x81\x05plain"])
+        server.send_binary(b"\x00\x01", compress=False)
+        self.assertEqual(server.data_to_send(), [b"\x82\x02\x00\x01"])
 
 
 class MiscTests(unittest.TestCase):

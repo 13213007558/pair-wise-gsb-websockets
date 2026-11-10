@@ -32,6 +32,17 @@ notice.
 
 *In development*
 
+Improvements
+............
+
+* Added a ``compress`` argument to
+  :meth:`~asyncio.connection.Connection.send` and
+  :meth:`~sync.connection.Connection.send` to skip Per-Message Deflate
+  compression for a single message, for example when it contains a credential.
+  The choice applies to the entire message; uncompressed messages don't enter
+  the compression context, so context takeover keeps working. It has no effect
+  when no compression extension is negotiated.
+
 .. _17.4:
 
 17.4

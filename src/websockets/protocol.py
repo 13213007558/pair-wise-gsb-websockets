@@ -317,7 +317,9 @@ class Protocol:
         self.expect_continuation_frame = not fin
         self.send_frame(Frame(CONT, data, fin))
 
-    def send_text(self, data: BytesLike, fin: bool = True) -> None:
+    def send_text(
+        self, data: BytesLike, fin: bool = True, compress: bool = True
+    ) -> None:
         """
         Send a `Text frame`_.
 
@@ -328,6 +330,10 @@ class Protocol:
             data: payload containing text encoded with UTF-8.
             fin: FIN bit; set it to :obj:`False` if this is the first frame of
                 a fragmented message.
+            compress: whether to compress the message when a compression
+                extension is negotiated. The choice applies to the entire
+                message; :meth:`send_continuation` frames inherit it. It has no
+                effect when no compression extension is negotiated.
 
         Raises:
             ProtocolError: If a fragmented message is in progress.
@@ -338,9 +344,14 @@ class Protocol:
         if self._state is not OPEN:
             raise InvalidState(f"connection is {self.state.name.lower()}")
         self.expect_continuation_frame = not fin
-        self.send_frame(Frame(TEXT, data, fin))
+        self.send_frame(Frame(TEXT, data, fin, compress=compress))
 
-    def send_binary(self, data: BytesLike, fin: bool = True) -> None:
+    def send_binary(
+        self,
+        data: BytesLike,
+        fin: bool = True,
+        compress: bool = True,
+    ) -> None:
         """
         Send a `Binary frame`_.
 
@@ -351,6 +362,10 @@ class Protocol:
             data: payload containing arbitrary binary data.
             fin: FIN bit; set it to :obj:`False` if this is the first frame of
                 a fragmented message.
+            compress: whether to compress the message when a compression
+                extension is negotiated. The choice applies to the entire
+                message; :meth:`send_continuation` frames inherit it. It has no
+                effect when no compression extension is negotiated.
 
         Raises:
             ProtocolError: If a fragmented message is in progress.
@@ -361,7 +376,7 @@ class Protocol:
         if self._state is not OPEN:
             raise InvalidState(f"connection is {self.state.name.lower()}")
         self.expect_continuation_frame = not fin
-        self.send_frame(Frame(BINARY, data, fin))
+        self.send_frame(Frame(BINARY, data, fin, compress=compress))
 
     def send_close(self, code: CloseCode | int | None = None, reason: str = "") -> None:
         """

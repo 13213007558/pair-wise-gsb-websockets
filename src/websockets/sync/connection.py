@@ -432,6 +432,7 @@ class Connection:
         message: DataLike | Iterable[DataLike],
         *,
         text: bool | None = None,
+        compress: bool = True,
     ) -> None:
         """
         Send a message.
@@ -453,6 +454,13 @@ class Connection:
         * Set ``text=False`` to send a string (:class:`str`) in a Binary_
           frame. This may be useful for servers that expect binary frames
           instead of text frames.
+
+        When the Per-Message Deflate extension is negotiated, you may skip
+        compression for a message with ``compress=False``. This is useful for
+        sensitive messages, such as credentials, that shouldn't enter the
+        compression context, or for data that's already compressed. The choice
+        applies to the entire message, including all fragments. When no
+        compression extension is negotiated, this argument has no effect.
 
         :meth:`send` also accepts an iterable of strings, bytestrings, or
         bytes-like objects to enable fragmentation_. Each item is treated as a
@@ -476,6 +484,8 @@ class Connection:
         Args:
             message: Message to send.
             text: Force sending in a Text_ or Binary_ frame.
+            compress: Whether to compress the message when a compression
+                extension is negotiated.
 
         Raises:
             ConnectionClosed: When the connection is closed.
@@ -494,9 +504,9 @@ class Connection:
                         "cannot call send while another thread is already running send"
                     )
                 if text is False:
-                    self.protocol.send_binary(message.encode())
+                    self.protocol.send_binary(message.encode(), compress=compress)
                 else:
-                    self.protocol.send_text(message.encode())
+                    self.protocol.send_text(message.encode(), compress=compress)
 
         elif isinstance(message, BytesLike):
             with self.send_context():
@@ -505,9 +515,9 @@ class Connection:
                         "cannot call send while another thread is already running send"
                     )
                 if text is True:
-                    self.protocol.send_text(message)
+                    self.protocol.send_text(message, compress=compress)
                 else:
-                    self.protocol.send_binary(message)
+                    self.protocol.send_binary(message, compress=compress)
 
         # Catch a common mistake — passing a dict to send().
 
@@ -534,9 +544,17 @@ class Connection:
                             )
                         self.send_in_progress = True
                         if text is False:
-                            self.protocol.send_binary(chunk.encode(), fin=False)
+                            self.protocol.send_binary(
+                                chunk.encode(),
+                                fin=False,
+                                compress=compress,
+                            )
                         else:
-                            self.protocol.send_text(chunk.encode(), fin=False)
+                            self.protocol.send_text(
+                                chunk.encode(),
+                                fin=False,
+                                compress=compress,
+                            )
                     encode = True
                 elif isinstance(chunk, BytesLike):
                     with self.send_context():
@@ -547,9 +565,17 @@ class Connection:
                             )
                         self.send_in_progress = True
                         if text is True:
-                            self.protocol.send_text(chunk, fin=False)
+                            self.protocol.send_text(
+                                chunk,
+                                fin=False,
+                                compress=compress,
+                            )
                         else:
-                            self.protocol.send_binary(chunk, fin=False)
+                            self.protocol.send_binary(
+                                chunk,
+                                fin=False,
+                                compress=compress,
+                            )
                     encode = False
                 else:
                     raise TypeError("iterable must contain bytes or str")
