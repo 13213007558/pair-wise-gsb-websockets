@@ -15,6 +15,7 @@ UNMAPPED_SRC_FILES = [
 
 UNMAPPED_TEST_FILES = [
     "tests/test_exports.py",
+    "tests/extensions/test_negotiation.py",
 ]
 
 
