@@ -32,6 +32,15 @@ notice.
 
 *In development*
 
+New features
+............
+
+* Added a ``max_pending_pings`` argument to :func:`~asyncio.client.connect`,
+  :func:`~asyncio.server.serve`, :func:`~sync.client.connect`, and
+  :func:`~sync.server.serve` to limit the number of pings waiting for a pong.
+  When the limit is reached, :meth:`~asyncio.connection.Connection.ping` raises
+  :exc:`~exceptions.ConcurrencyError` instead of growing memory without bounds.
+
 .. _17.4:
 
 17.4

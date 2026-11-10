@@ -62,8 +62,9 @@ class ServerConnection(Connection):
     :exc:`~websockets.exceptions.ConnectionClosedError` when the connection is
     closed with any other code.
 
-    The ``ping_interval``, ``ping_timeout``, ``close_timeout``, and
-    ``max_queue`` arguments have the same meaning as in :func:`serve`.
+    The ``ping_interval``, ``ping_timeout``, ``close_timeout``, ``max_queue``,
+    and ``max_pending_pings`` arguments have the same meaning as in
+    :func:`serve`.
 
     Args:
         socket: Socket connected to a WebSocket client.
@@ -82,6 +83,7 @@ class ServerConnection(Connection):
         ping_timeout: float | None = 20,
         close_timeout: float | None = 10,
         max_queue: int | None | tuple[int | None, int | None] = 16,
+        max_pending_pings: int | None = None,
     ) -> None:
         self.protocol: ServerProtocol
         self.request_rcvd = threading.Event()
@@ -92,6 +94,7 @@ class ServerConnection(Connection):
             ping_timeout=ping_timeout,
             close_timeout=close_timeout,
             max_queue=max_queue,
+            max_pending_pings=max_pending_pings,
         )
         self.server = server
         self.username: str  # see basic_auth()
@@ -513,6 +516,7 @@ def serve(
     # Limits
     max_size: int | None | tuple[int | None, int | None] = 2**20,
     max_queue: int | None | tuple[int | None, int | None] = 16,
+    max_pending_pings: int | None = None,
     # Logging
     logger: LoggerLike | None = None,
     # Escape hatch for advanced customization
@@ -614,6 +618,10 @@ def serve(
             // 4``. You may pass a ``(high, low)`` tuple to set the high-water
             and low-water marks. If you want to disable flow control entirely,
             you may set it to ``None``, although that's a bad idea.
+        max_pending_pings: Maximum number of pings waiting for a pong.
+            :meth:`~websockets.sync.connection.Connection.ping` raises
+            :exc:`~websockets.exceptions.ConcurrencyError` when the limit is
+            reached. :obj:`None` disables the limit.
         logger: Logger for this server.
             It defaults to ``logging.getLogger("websockets.server")``.
             See the :doc:`logging guide <../../topics/logging>` for details.
@@ -752,6 +760,7 @@ def serve(
                 ping_timeout=ping_timeout,
                 close_timeout=close_timeout,
                 max_queue=max_queue,
+                max_pending_pings=max_pending_pings,
             )
         except Exception:
             try:

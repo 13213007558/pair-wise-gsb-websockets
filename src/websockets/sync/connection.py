@@ -58,12 +58,14 @@ class Connection:
         ping_timeout: float | None = 20,
         close_timeout: float | None = 10,
         max_queue: int | None | tuple[int | None, int | None] = 16,
+        max_pending_pings: int | None = None,
     ) -> None:
         self.socket = sock
         self.protocol = protocol
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
         self.close_timeout = close_timeout
+        self.max_pending_pings = max_pending_pings
         if isinstance(max_queue, int) or max_queue is None:
             max_queue_high, max_queue_low = max_queue, None
         else:
@@ -684,6 +686,7 @@ class Connection:
             ConnectionClosed: When the connection is closed.
             ConcurrencyError: If another ping was sent with the same data and
                 the corresponding pong wasn't received yet.
+            ConcurrencyError: If the ``max_pending_pings`` limit is reached.
 
         """
         self.maybe_raise_legacy_warning()
@@ -695,6 +698,16 @@ class Connection:
             raise TypeError("data must be str or bytes-like")
 
         with self.send_context():
+            # Protect against unbounded growth of pending pings.
+            if (
+                self.max_pending_pings is not None
+                and len(self.pending_pings) >= self.max_pending_pings
+            ):
+                raise ConcurrencyError(
+                    f"too many pending pings (max_pending_pings="
+                    f"{self.max_pending_pings})"
+                )
+
             # Protect against duplicates if a payload is explicitly set.
             if data in self.pending_pings:
                 raise ConcurrencyError("already waiting for a pong with the same data")
@@ -820,6 +833,12 @@ class Connection:
                     pong_received = self.ping(ack_on_close=True)
                 except ConnectionClosed:
                     break
+                except ConcurrencyError:
+                    # The max_pending_pings limit is reached. Skip this
+                    # keepalive ping and try again at the next interval.
+                    if self.debug:
+                        self.logger.debug("% skipped keepalive ping")
+                    continue
                 if self.debug:
                     self.logger.debug("% sent keepalive ping")
 

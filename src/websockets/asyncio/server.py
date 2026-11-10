@@ -55,7 +55,8 @@ class ServerConnection(Connection):
     closed with any other code.
 
     The ``ping_interval``, ``ping_timeout``, ``close_timeout``, ``max_queue``,
-    and ``write_limit`` arguments have the same meaning as in :func:`serve`.
+    ``max_pending_pings``, and ``write_limit`` arguments have the same meaning
+    as in :func:`serve`.
 
     Args:
         protocol: Sans-I/O connection.
@@ -72,6 +73,7 @@ class ServerConnection(Connection):
         ping_timeout: float | None = 20,
         close_timeout: float | None = 10,
         max_queue: int | None | tuple[int | None, int | None] = 16,
+        max_pending_pings: int | None = None,
         write_limit: int | tuple[int, int | None] = 2**15,
     ) -> None:
         self.protocol: ServerProtocol
@@ -81,6 +83,7 @@ class ServerConnection(Connection):
             ping_timeout=ping_timeout,
             close_timeout=close_timeout,
             max_queue=max_queue,
+            max_pending_pings=max_pending_pings,
             write_limit=write_limit,
         )
         self.server = server
@@ -516,6 +519,7 @@ def serve(
     # Limits
     max_size: int | None | tuple[int | None, int | None] = 2**20,
     max_queue: int | None | tuple[int | None, int | None] = 16,
+    max_pending_pings: int | None = None,
     write_limit: int | tuple[int, int | None] = 2**15,
     # Logging
     logger: LoggerLike | None = None,
@@ -635,6 +639,10 @@ def serve(
             // 4``. You may pass a ``(high, low)`` tuple to set the high-water
             and low-water marks. If you want to disable flow control entirely,
             you may set it to ``None``, although that's a bad idea.
+        max_pending_pings: Maximum number of pings waiting for a pong.
+            :meth:`~websockets.asyncio.connection.Connection.ping` raises
+            :exc:`~websockets.exceptions.ConcurrencyError` when the limit is
+            reached. :obj:`None` disables the limit.
         write_limit: High-water mark of write buffer in bytes. It is passed to
             :meth:`~asyncio.WriteTransport.set_write_buffer_limits`. It defaults
             to 32 KiB. You may pass a ``(high, low)`` tuple to set the
@@ -727,6 +735,7 @@ def serve(
             ping_timeout=ping_timeout,
             close_timeout=close_timeout,
             max_queue=max_queue,
+            max_pending_pings=max_pending_pings,
             write_limit=write_limit,
         )
         return connection
