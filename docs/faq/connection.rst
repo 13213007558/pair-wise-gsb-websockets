@@ -132,3 +132,25 @@ You can bind additional arguments to the connection factory with
         ...
 
 This example was for a server. The same pattern applies on a client.
+
+How do I reject a message while streaming it?
+---------------------------------------------
+
+When you receive a message with :meth:`Connection.recv_streaming`, you may
+decide to reject it after reading its first fragment — for example, when
+business validation fails.
+
+To keep the connection usable, consume the iterator to the end in order to
+discard the remaining fragments of the rejected message:
+
+.. literalinclude:: ../../example/faq/reject_message_server.py
+    :emphasize-lines: 30-34
+
+If you stop consuming the iterator in the middle of a message, the
+connection becomes unusable: :meth:`Connection.recv` and
+:meth:`Connection.recv_streaming` raise
+:exc:`~websockets.exceptions.ConcurrencyError`. This fail-safe prevents the
+remainder of the rejected message from being delivered as the next message.
+Then you must close the connection with :meth:`Connection.close`.
+
+The same applies to the :mod:`threading <websockets.sync>` implementation.

@@ -375,6 +375,142 @@ class ClientConnectionTests(LoggingTestCase, ThreadTestCase):
             "is already running recv or recv_streaming",
         )
 
+    def test_recv_streaming_message_boundaries(self):
+        """recv_streaming and recv deliver each message within its boundaries."""
+        # Business message boundaries in this frame sequence:
+        # - message 1 = frames 1-3: "café", with "é" split across two frames;
+        # - message 2 = frame 4: "tea";
+        # - message 3 = frame 5: "😀".
+        self.connection.recv_messages.put(Frame(TEXT, b"ca", fin=False))
+        self.connection.recv_messages.put(Frame(CONT, b"f\xc3", fin=False))
+        self.connection.recv_messages.put(Frame(CONT, b"\xa9"))
+        self.connection.recv_messages.put(Frame(TEXT, b"tea"))
+        self.connection.recv_messages.put(Frame(TEXT, "😀".encode()))
+
+        # Message 1 is delivered fragment by fragment, decoding "é" correctly.
+        self.assertEqual(
+            list(self.connection.recv_streaming()),
+            ["ca", "f", "é"],
+        )
+        # Fully consuming messages keeps the connection usable.
+        self.assertEqual(self.connection.recv(), "tea")
+        self.assertEqual(list(self.connection.recv_streaming()), ["😀"])
+
+    def test_recv_streaming_utf8_character_split_across_frames(self):
+        """recv_streaming decodes a UTF-8 character split across frames."""
+        # "é" is encoded as b"\xc3\xa9"; the two bytes arrive in two frames.
+        self.connection.recv_messages.put(Frame(TEXT, b"caf\xc3", fin=False))
+        self.connection.recv_messages.put(Frame(CONT, b"\xa9"))
+        self.assertEqual(
+            list(self.connection.recv_streaming()),
+            ["caf", "é"],
+        )
+
+    def test_recv_streaming_abandon_before_first_fragment(self):
+        """recv_streaming can be abandoned safely before the first fragment."""
+        iterator = self.connection.recv_streaming()
+        iterator.close()
+
+        # No frame was consumed: the connection remains usable.
+        self.remote_connection.send(["😀", "😀"])
+        self.assertEqual(
+            list(self.connection.recv_streaming()),
+            ["😀", "😀", ""],
+        )
+
+    def test_recv_streaming_abandon_after_first_fragment(self):
+        """Abandoning recv_streaming after the first fragment breaks the connection."""
+        # Business message boundaries in this frame sequence:
+        # - message 1 = frames 1-2: "café", rejected after "ca";
+        # - message 2 = frame 3: "tea", which must never be delivered.
+        self.connection.recv_messages.put(Frame(TEXT, b"ca", fin=False))
+        self.connection.recv_messages.put(Frame(CONT, "fé".encode()))
+        self.connection.recv_messages.put(Frame(TEXT, b"tea"))
+
+        # Business validation rejects the message after its first fragment
+        # and abandons the iterator.
+        iterator = self.connection.recv_streaming()
+        self.assertEqual(next(iterator), "ca")
+        iterator.close()
+
+        # The connection is unusable: the remainder of the rejected message
+        # must never be delivered as the next message.
+        with self.assertRaises(ConcurrencyError):
+            self.connection.recv()
+        with self.assertRaises(ConcurrencyError):
+            list(self.connection.recv_streaming())
+
+        # The assembler still holds the message: clearing this flag early
+        # would deliver b"f\xc3\xa9" — the rest of the rejected message.
+        self.assertTrue(self.connection.recv_messages.get_in_progress)
+
+        # The only recourse is closing the connection.
+        self.connection.close()
+
+    def test_recv_during_recv_streaming_holding_partial_message(self):
+        """recv raises ConcurrencyError while recv_streaming holds a partial message."""
+        # Business message boundaries: a single message "café" in two frames.
+        self.connection.recv_messages.put(Frame(TEXT, b"ca", fin=False))
+        barrier = threading.Barrier(2)
+        fragments = []
+
+        def receive():
+            iterator = self.connection.recv_streaming()
+            fragments.append(next(iterator))
+            # Hold the partial message while the main thread attempts recv().
+            barrier.wait()
+            fragments.extend(iterator)
+
+        thread = threading.Thread(target=receive)
+        thread.start()
+        try:
+            # recv_streaming is suspended with the first fragment in hand.
+            barrier.wait()
+            with self.assertRaises(ConcurrencyError) as raised:
+                self.connection.recv()
+        finally:
+            # Release the remaining fragment so the thread can finish.
+            self.connection.recv_messages.put(Frame(CONT, "fé".encode()))
+            thread.join(MS)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(fragments, ["ca", "fé"])
+        self.assertEqual(
+            str(raised.exception),
+            "cannot call recv while another thread "
+            "is already running recv or recv_streaming",
+        )
+
+    def test_recv_streaming_invalid_utf8_in_later_fragment(self):
+        """recv_streaming fails the connection on invalid UTF-8 in a later fragment."""
+        # Business message boundaries: a single message in two frames;
+        # the second frame isn't valid UTF-8.
+        self.connection.recv_messages.put(Frame(TEXT, b"caf", fin=False))
+        self.connection.recv_messages.put(Frame(CONT, b"\xff"))
+
+        iterator = self.connection.recv_streaming()
+        with contextlib.closing(iterator):
+            self.assertEqual(next(iterator), "caf")
+            with self.assertRaises(ConnectionClosedError) as raised:
+                next(iterator)
+
+        # The connection is failed with 1007 and closed: it cannot be reused.
+        self.assertEqual(raised.exception.sent.code, CloseCode.INVALID_DATA)
+        self.assertIsInstance(raised.exception.__cause__, UnicodeDecodeError)
+
+    def test_recv_streaming_remote_close_between_fragments(self):
+        """recv_streaming raises ConnectionClosedOK when the remote closes midway."""
+        # Business message boundaries: a single message; only the first of
+        # two frames arrives before the remote closes the connection.
+        self.connection.recv_messages.put(Frame(TEXT, "⏳".encode(), fin=False))
+
+        iterator = self.connection.recv_streaming()
+        with contextlib.closing(iterator):
+            self.assertEqual(next(iterator), "⏳")
+            self.remote_connection.close()
+            with self.assertRaises(ConnectionClosedOK):
+                next(iterator)
+
     # Test send.
 
     def test_send_text(self):

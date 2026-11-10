@@ -380,6 +380,28 @@ class AssemblerTests(ThreadTestCase):
             next(iterator)
             self.resume.assert_not_called()
 
+    def test_close_get_iter_before_first_frame(self):
+        """get_iter can be closed safely before reading the first frame."""
+        iterator = self.assembler.get_iter()
+        iterator.close()
+
+        self.assembler.put(Frame(TEXT, b"caf\xc3\xa9"))
+        fragments = list(self.assembler.get_iter())
+        self.assertEqual(fragments, ["café"])
+
+    def test_close_get_iter_after_first_frame(self):
+        """get_iter cannot be closed after reading the first frame."""
+        self.assembler.put(Frame(TEXT, b"ca", fin=False))
+
+        iterator = self.assembler.get_iter()
+        self.assertEqual(next(iterator), "ca")
+        iterator.close()
+
+        self.assembler.put(Frame(CONT, b"f\xc3", fin=False))
+        self.assembler.put(Frame(CONT, b"\xa9"))
+        with self.assertRaises(ConcurrencyError):
+            list(self.assembler.get_iter())
+
     # Test put.
 
     def test_put_pauses_reading(self):
